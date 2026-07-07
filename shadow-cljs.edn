@@ -1,0 +1,5 @@
+;; Test-only build (this lib has no deploy target of its own -- see README).
+{:deps {:aliases [:cljs :test-node]}
+ :builds {:test-node
+          {:target :node-test :output-to "target/node-tests.js"
+           :ns-regexp "-test$" :autorun true}}}
