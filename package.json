@@ -4,7 +4,7 @@
   "private": true,
   "description": "Platform-independent XRPC handler + async/sync storage bridge for a kotobase-peer-backed worker. No deploy surface.",
   "scripts": {
-    "test:cljs": "shadow-cljs compile test-node && node out/test-node.js"
+    "test:cljs": "shadow-cljs compile test-node"
   },
   "dependencies": {
     "@noble/hashes": "^1.4.0",
