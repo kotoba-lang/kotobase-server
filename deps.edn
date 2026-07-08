@@ -4,7 +4,7 @@
  ;; Cloudflare/R2/B2-specific code -- see README.md.
  :deps {io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "8e2eb554759bb0cd8e92a8ecafc0c5a64229e34c"}
+         :git/sha "ed8de7406e6b7d39a9571801595d91b92cafdd44"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
          :git/sha "ac7fe263e65eeb129bac63c5ea243b2e75254cd4"}}

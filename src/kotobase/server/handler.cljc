@@ -140,43 +140,342 @@
               :novelty_size (eng/novelty-size get-fn chain)}))))
 
 (defn- hot-db
-  "The full hot db as of `chain` (snapshot + novelty merged) -- for `do-q`,
-  which needs an actual db value to route a multi-attribute pattern through
-  arrangement.query. Composed entirely from kotobase-peer's public API
-  (hot-datoms + transact), so it stays correct against novelty without
-  kotobase-peer needing its own db-shaped 'hot-db' primitive."
+  "The full hot db as of `chain` (snapshot + novelty merged) -- for `do-q`/
+  `do-pull`/`do-entity`/`do-entid`/`do-ident`/`do-pull-many`, which need an
+  actual db value (to route a multi-attribute pattern through
+  arrangement.query/datalog, or to navigate ref-valued attrs via `pull`/
+  `entity`). Delegates directly to kotobase-peer's own `hydrate-chain` --
+  this fn used to hand-roll the equivalent via hot-datoms + a fresh
+  `transact` (a workaround from before kotobase-peer had this primitive
+  itself, see git history); `hydrate-chain` is kotobase-peer's own, more
+  direct implementation of exactly this, now used instead."
   [store chain]
-  (then* (eng/hot-datoms (:get-fn store) chain (constantly true)
-                         (:blind-fn store) (:decrypt-fn store))
-         (fn [rows]
-           (eng/transact (eng/empty-db)
-                         (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
-                              rows)))))
+  (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)))
 
 (defn do-q
-  "`datomic.q` -- triple-pattern query. Rebuilds a hot db from
-  snapshot+novelty then routes through arrangement.query. body:
-  {:graph :query_edn} where query_edn is a `[s p o]` pattern (nil =
-  wildcard).
-
-  `eng/q`'s `visible?` is required (ADR-2607050500) -- passes
-  `(constantly true)` explicitly, same reasoning as `do-datoms`."
-  [store {:keys [graph query_edn]}]
+  "`datomic.q` -- routes to ONE of two engines depending on `query_edn`'s
+  shape: a plain `[s p o]` vector (nil = wildcard) is a triple-pattern
+  query (`eng/q`, arrangement.query -- no joins, returns a set of `{:s :p
+  :o}` quads); a map with `:find`/`:where` keys is a full conjunctive
+  Datalog query (`eng/query`, arrangement.datalog -- multi-clause joins,
+  negation, aggregates, recursive rules; returns a set of `:find`-ordered
+  VECTORS, a different row shape from the triple-pattern branch -- the
+  caller already knows which it sent and therefore which shape comes
+  back). Previously this ALWAYS called `eng/q`, silently mistreating any
+  map-shaped query as a malformed/empty triple pattern instead of routing
+  it to the engine that actually understands it -- a real, if latent,
+  bug (see git history): `net-kotobase`'s `geo.search`/`web.search`
+  (domain_search.cljc's own \"candidate query\") send exactly this map
+  shape today. body: {:graph :query_edn :inputs_edn} -- `inputs_edn`
+  (optional) is an EDN vector matching `query_edn`'s own `:in` clause
+  order, for the Datalog form only (see `eng/query`'s docstring); ignored
+  for a triple-pattern query."
+  [store {:keys [graph query_edn inputs_edn]}]
   (let [chain ((:head-get store) graph)
-        pat   (edn/read-string query_edn)]
+        pat (edn/read-string query_edn)]
     (then* (hot-db store chain)
-           (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat (constantly true)))}))))
+           (fn [db]
+             (let [rows (if (and (map? pat) (or (contains? pat :find) (contains? pat :where)))
+                          (if inputs_edn
+                            (eng/query db pat (constantly true) (edn/read-string inputs_edn))
+                            (eng/query db pat (constantly true)))
+                          (eng/q db pat (constantly true)))]
+               {:ok true :graph graph :rows (vec rows)})))))
 
 (defn do-pull
-  "`datomic.pull` -- all attrs of one entity, via hot-datoms (snapshot +
-  novelty merge). body: {:graph :entity}."
+  "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
+  novelty merge), UNLESS the caller supplies `:pattern_edn` (a Datomic
+  pull-pattern EDN string -- see kotobase-peer's `pull` docstring for the
+  grammar: plain attrs, `'*` wildcard, `\"_attr\"` reverse nav, `{attr
+  [sub-pattern]}` nested pull, `{attr n}`/`{attr '...}` recursion), in
+  which case this now actually honors it (previously silently ignored --
+  kotobase-client sends the field, the handler dropped it on the floor;
+  see git history) by materializing a db (`hot-db`) and running
+  kotobase-peer's real pattern-aware `pull`.
+
+  The two response shapes are DIFFERENT and not interchangeable: the
+  no-pattern legacy path returns `:attrs {a [v_edn...]}` (per-attribute
+  wire-encoded value strings, hot-datoms rows regrouped -- unchanged, for
+  every existing caller that doesn't send `pattern_edn`); the pattern
+  path returns `:result_edn` (the WHOLE pull-pattern result tree, pr-str'd
+  once -- a pattern can nest/wildcard/reverse-nav arbitrarily, so there is
+  no single flat per-leaf v_edn encoding that composes across that the
+  way there is for a flat attr map). body: {:graph :entity :pattern_edn}."
+  [store {:keys [graph entity pattern_edn]}]
+  (if pattern_edn
+    (let [chain ((:head-get store) graph)
+          pattern (edn/read-string pattern_edn)]
+      (then* (hot-db store chain)
+             (fn [db] {:ok true :graph graph :entity entity
+                       :result_edn (pr-str (eng/pull db entity pattern))})))
+    (let [chain ((:head-get store) graph)]
+      (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                             (constantly true) (:blind-fn store) (:decrypt-fn store))
+             (fn [rows]
+               {:ok true :graph graph :entity entity
+                :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))
+
+(defn do-pull-many
+  "`datomic.pullMany` -- the same pull pattern applied to a LIST of
+  entities. body: {:graph :entities :pattern_edn} -- `:entities` a vector
+  of entity ids, `:pattern_edn` required (unlike `do-pull`, pullMany has
+  no flat-attrs legacy shape to fall back to)."
+  [store {:keys [graph entities pattern_edn]}]
+  (let [chain ((:head-get store) graph)
+        pattern (edn/read-string pattern_edn)]
+    (then* (hot-db store chain)
+           (fn [db]
+             {:ok true :graph graph
+              :results_edn (mapv #(pr-str (eng/pull db % pattern)) entities)}))))
+
+(defn do-index-pull
+  "`datomic.indexPull` -- Datomic's index-based pull, a comparatively
+  obscure/rarely-used corner of the real Datomic API. No distinct mapping
+  onto this substrate's primitives exists beyond what `datomic.pullMany`
+  already does (pull the same pattern over a caller-given list of
+  entities) -- implemented as a direct alias rather than inventing a
+  different, unproven contract for a method with no pinned wire shape and
+  no clear semantic gap `pullMany` doesn't already cover."
+  [store body]
+  (do-pull-many store body))
+
+(defn do-entity
+  "`datomic.entity` -- `pull`'s flat 2-arg form (`{p #{o...}}`) under
+  Datomic's own name. Unlike `do-pull`'s no-pattern path (hot-datoms
+  based, per-attribute `v_edn` wire strings), this needs a fully
+  materialized db (kotobase-peer's `entity` is the pull-flat-form
+  entry point a caller can then `entity-attr`-navigate further, though
+  that on-demand navigation itself isn't wired to a separate NSID here --
+  see `datomic.pull`'s `{attr [...]}` nested-pull pattern for the
+  equivalent eager form). Returns the WHOLE entity map pr-str'd
+  (`:entity_edn`), same reasoning as `do-pull`'s pattern path: raw
+  decoded values, not per-attribute wire strings. body: {:graph :entity}."
   [store {:keys [graph entity]}]
   (let [chain ((:head-get store) graph)]
-    (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+    (then* (hot-db store chain)
+           (fn [db] {:ok true :graph graph :entity entity
+                     :entity_edn (pr-str (eng/entity db entity))}))))
+
+(defn do-entid
+  "`datomic.entid` -- resolve an id-or-ident to the actual entity id
+  (kotobase-peer's `entid`: a plain string id passes through unchanged;
+  a keyword id resolves via a `:db/ident` attribute lookup -- see its
+  docstring for why this substrate needs no numeric-id resolution the
+  way real Datomic's `entid` does). body: {:graph :ident_edn} --
+  `:ident_edn` is an EDN string (so the caller can send either a plain
+  string id or a keyword ident through the same field, unambiguously)."
+  [store {:keys [graph ident_edn]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (hot-db store chain)
+           (fn [db] {:ok true :graph graph
+                     :entity_id (eng/entid db (edn/read-string ident_edn))}))))
+
+(defn do-ident
+  "`datomic.ident` -- the inverse of `entid`: the `:db/ident` keyword an
+  entity has asserted on itself, or nil. body: {:graph :entity}.
+  `:ident_edn` in the response is pr-str'd (nil pr-str's to the string
+  \"nil\", NOT omitted -- a caller distinguishes \"no ident\" from a
+  malformed response by the field always being present)."
+  [store {:keys [graph entity]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (hot-db store chain)
+           (fn [db] {:ok true :graph graph :entity entity
+                     :ident_edn (pr-str (eng/ident db entity))}))))
+
+(defn do-as-of
+  "`datomic.asOf` -- a `datoms`-shaped read of the graph AS OF commit `t`
+  (Datomic's own term; kotobase-peer's chain calls the same value `seq`).
+  body: {:graph :t :index :components_edn :limit}, same read shape as
+  `do-datoms` beyond `:t`. A `t` beyond the chain's own tip clamps to the
+  tip (kotobase-peer's `as-of`'s own \"as-of the future just means now\"
+  behavior, matching Datomic); a nil/absent chain (fresh graph) resolves
+  to `{:datoms []}`, same as `do-datoms` on a fresh graph."
+  [store {:keys [graph t index components_edn limit]}]
+  (let [chain ((:head-get store) graph)
+        as-of-chain (eng/as-of (:get-fn store) chain t)]
+    (then* (eng/hot-datoms (:get-fn store) as-of-chain
+                           {:index (or (index-kw index) :eavt)
+                            :components (vec components_edn)
+                            :limit limit}
+                           (constantly true) (:blind-fn store) (:decrypt-fn store))
+           (fn [rows] {:ok true :graph graph :t t :datoms (vec rows)}))))
+
+(defn do-since
+  "`datomic.since` -- quads from commits with `:seq` greater than `t`
+  (Datomic's `since`; a DIFF view, NOT merged with prior state -- see
+  `datomic.asOf`/plain `datomic.datoms` for the merged view). body:
+  {:graph :t}."
+  [store {:keys [graph t]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/since (:get-fn store) chain t (:decrypt-fn store))
+           (fn [db] {:ok true :graph graph :t t
+                     :datoms (vec (eng/datoms db (constantly true)))}))))
+
+(defn do-history
+  "`datomic.history` -- the full audit-log view: every quad EVER asserted
+  across the whole chain, including later-retracted facts, as
+  `{:e :a :v_edn :added}` rows distinguishing assert from retract
+  (Datomic's `(d/datoms (d/history db) ...)`, here via kotobase-peer's
+  `history-datoms`). body: {:graph :entity} -- `:entity` (optional)
+  narrows to one entity's history (the single most common ask, \"what
+  happened to THIS entity\"); omitting it is O(all history) -- see
+  kotobase-peer's own `history-datoms` docstring, which also documents an
+  honest limitation around `snapshot!`-seeded (migration-imported)
+  content with no individual assert event."
+  [store {:keys [graph entity]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/history-datoms (:get-fn store) chain entity (constantly true) (:decrypt-fn store))
+           (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
+
+(defn do-basis-t
+  "`datomic.basisT` -- the current basis (chain tip `:seq`), a monotonic
+  value comparable across reads of the same graph (Datomic's own basisT
+  contract: a value you can compare, not a wall-clock time -- matches
+  kotobase-peer's own design note on why commits are keyed by `:seq`, not
+  a timestamp). body: {:graph}. A fresh, never-written graph reports
+  `:t nil` (no basis yet), not an error -- same posture `do-datoms`
+  already takes for `{:datoms []}` on a nil chain. Pure/sync -- `chain`
+  touches no crypto, so this needs no `then*` wrapping on either
+  platform."
+  [store {:keys [graph]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        entries (when chain (eng/chain get-fn chain))]
+    {:ok true :graph graph :t (:seq (last entries))}))
+
+(defn do-db-stats
+  "`datomic.dbStats` -- cheap graph-shape metadata without a full read:
+  current basis (`:t`, same value `do-basis-t` reports), whether anything
+  has been folded yet (`:has_snapshot`), and how many not-yet-folded tx
+  blocks sit on top (`:novelty_size`, the same `fold`-worthiness signal
+  `do-transact`'s own response already surfaces per-write). body:
+  {:graph}. Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        entries (when chain (eng/chain get-fn chain))]
+    {:ok true :graph graph
+     :t (:seq (last entries))
+     :has_snapshot (boolean (and chain (eng/latest-snapshot-cid get-fn chain)))
+     :novelty_size (if chain (eng/novelty-size get-fn chain) 0)}))
+
+(defn do-seek-datoms
+  "`datomic.seekDatoms` -- Datomic's index-scan-from-a-position read.
+  HONEST APPROXIMATION: this substrate's `datoms`/`hot-datoms` already do
+  an index scan filtered by a `:components` PREFIX match (not a true
+  ordered \"seek to >= these components and continue\" the way Datomic's
+  own seekDatoms works) -- for the common case (seek to an exact entity/
+  attribute prefix and read forward) this is equivalent; it is NOT
+  equivalent for a genuine \">= partial value\" ordered seek. A real
+  ordered seek would need a new kotobase-peer primitive, not implemented
+  here -- this is a thin alias of `do-datoms`, not a distinct
+  implementation. body: identical to `do-datoms`."
+  [store body]
+  (do-datoms store body))
+
+(defn do-index-range
+  "`datomic.indexRange` -- every datom for one attribute whose value
+  falls in `[start, end]` (inclusive; either bound optional), Datomic's
+  AVET range scan. HONEST APPROXIMATION, two layers of it:
+
+  1. Implemented as a full AVET scan for the attribute (`hot-datoms` with
+     `:avet` + `:components [attr]`) followed by an in-process value-range
+     filter -- correct, but O(all values for that attribute), not a true
+     ordered range-seek (no ordered-range primitive exists in
+     kotobase-peer for this yet).
+  2. MORE IMPORTANTLY: this substrate stringifies every non-Link value at
+     write time (kotobase-server's own `tx-edn->quads`, `(str v)`, before
+     the quad ever reaches kotobase-peer) -- a transacted `:score 10`
+     round-trips as the STRING `\"10\"`, never the number `10`. So
+     `start_edn`/`end_edn`, compared against each row's own
+     `edn/read-string`'d `v_edn` via `compare`, effectively do
+     LEXICOGRAPHIC string comparison for anything that started life as a
+     number (`\"9\" > \"10\"` lexicographically -- NOT the numeric range a
+     caller sending numeric-looking bounds would expect). Passing
+     type-mismatched bounds (e.g. a bare number against the stored
+     string) throws outright (surfaced as `InternalError` by `handle`,
+     not a silent empty/wrong result) -- callers MUST pass `start_edn`/
+     `end_edn` shaped like what's actually stored (a pr-str'd STRING,
+     e.g. `\"\\\"15\\\"\"`, not a bare `\"15\"`) to avoid the throw, and
+     must additionally account for lexicographic-not-numeric ordering
+     themselves (e.g. zero-padding) if the range needs to be numerically
+     correct. body: {:graph :attr :start_edn :end_edn :limit}."
+  [store {:keys [graph attr start_edn end_edn limit]}]
+  (let [chain ((:head-get store) graph)
+        start (some-> start_edn edn/read-string)
+        end (some-> end_edn edn/read-string)]
+    (then* (eng/hot-datoms (:get-fn store) chain {:index :avet :components [attr]}
                            (constantly true) (:blind-fn store) (:decrypt-fn store))
            (fn [rows]
-             {:ok true :graph graph :entity entity
-              :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))))
+             (let [in-range? (fn [{:keys [v_edn]}]
+                                (let [v (edn/read-string v_edn)]
+                                  (and (or (nil? start) (>= (compare v start) 0))
+                                       (or (nil? end) (<= (compare v end) 0)))))
+                   filtered (filter in-range? rows)
+                   filtered (cond->> filtered limit (take limit))]
+               {:ok true :graph graph :attr attr :datoms (vec filtered)})))))
+
+(defn do-tx
+  "`datomic.tx` -- one commit's metadata (Datomic's own tx entity is
+  mostly opaque anyway beyond `:db/txInstant`, which this substrate
+  doesn't track by design -- see kotobase-peer's \"time-travel: as-of\"
+  section comment on why: no wall-clock field on the commit envelope, so
+  a chain stays stable across a future timestamp addition). body:
+  {:graph :t}. Does NOT include per-tx datom content -- kotobase-peer has
+  no public primitive to isolate one commit's own novelty out of the
+  whole-chain replay `history-datoms` does; use `datomic.since` with
+  `t-1` for that instead (a diff view across everything after a point,
+  equivalent to \"what that one commit added\" for an exact single `t`).
+  Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph t]}]
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        entry (some #(when (= t (:seq %)) %) entries)]
+    {:ok true :graph graph :t t :found (some? entry) :tx_cid (some-> entry :cid str)}))
+
+(defn do-tx-range
+  "`datomic.txRange` -- commit metadata for every `:seq` in `[start,
+  end)` (Datomic's own txRange semantics: start inclusive, end exclusive;
+  either bound omitted means unbounded on that side). body: {:graph
+  :start :end :limit}. Same per-tx-datom-content limitation as
+  `datomic.tx` above. Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph start end limit]}]
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        in-range? (fn [{:keys [seq]}]
+                    (and (or (nil? start) (>= seq start))
+                         (or (nil? end) (< seq end))))
+        filtered (filter in-range? entries)
+        filtered (cond->> filtered limit (take limit))]
+    {:ok true :graph graph
+     :txs (mapv (fn [{:keys [seq cid]}] {:t seq :tx_cid (str cid)}) filtered)}))
+
+(defn do-log
+  "`datomic.log` -- the full transaction log (or a `[start, end)` slice
+  if given) -- same shape as `datomic.txRange`, since Datomic's own
+  `log`/`txRange` overlap in practice (a bounded log IS a tx-range); not
+  a distinct implementation here either."
+  [store body]
+  (do-tx-range store body))
+
+(defn do-sync
+  "`datomic.sync` -- HONEST simplification: this substrate has no
+  distributed replication lag to wait out (the chain-cid IS the current
+  state the instant a write succeeds; there is no separate \"catching
+  up\" process an HTTP request/response cycle could meaningfully block
+  on). Reports whether the graph's current basis has already reached the
+  requested `:t`, IMMEDIATELY, rather than either (a) blocking (not
+  possible in a single request/response cycle) or (b) silently pretending
+  to have waited. A caller that actually needs \"block until this write
+  is visible\" should retry `datomic.sync` (or just re-read) rather than
+  treat this as a real async wait primitive. body: {:graph :t}. Pure/
+  sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph t]}]
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        current-t (:seq (last entries))]
+    {:ok true :graph graph :t t :current_t current-t
+     :caught_up (boolean (and current-t (>= current-t t)))}))
 
 (defn do-fold
   "`datomic.fold` -- compacts a graph's accumulated novelty into a fresh
@@ -221,11 +520,27 @@
                            :cljs (or (ex-message e) (.-message e)))}))]
     (try
       (let [resp (case method
-                   "datoms"   (do-datoms store body)
-                   "transact" (do-transact store body auth-did)
-                   "q"        (do-q store body)
-                   "pull"     (do-pull store body)
-                   "fold"     (do-fold store body)
+                   "datoms"      (do-datoms store body)
+                   "transact"    (do-transact store body auth-did)
+                   "q"           (do-q store body)
+                   "pull"        (do-pull store body)
+                   "pullMany"    (do-pull-many store body)
+                   "indexPull"   (do-index-pull store body)
+                   "fold"        (do-fold store body)
+                   "entity"      (do-entity store body)
+                   "entid"       (do-entid store body)
+                   "ident"       (do-ident store body)
+                   "asOf"        (do-as-of store body)
+                   "since"       (do-since store body)
+                   "history"     (do-history store body)
+                   "basisT"      (do-basis-t store body)
+                   "dbStats"     (do-db-stats store body)
+                   "seekDatoms"  (do-seek-datoms store body)
+                   "indexRange"  (do-index-range store body)
+                   "tx"          (do-tx store body)
+                   "txRange"     (do-tx-range store body)
+                   "log"         (do-log store body)
+                   "sync"        (do-sync store body)
                    {:ok false :error "MethodNotImplemented" :method method})]
         #?(:clj resp
            :cljs (.catch (js/Promise.resolve resp) err)))
