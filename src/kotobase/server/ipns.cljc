@@ -26,6 +26,16 @@
   (:require [clojure.string :as str]
             [kotobase.ipns :as ipns]))
 
+(defn- valid-sequence?
+  "A `:sequence` value the rollback comparison below can safely `<=`.
+  `(= x x)` is false for NaN on both JVM `Double` and JS `number` (IEEE-754
+  self-inequality), so this catches NaN without a reader-conditional --
+  needed because a non-numeric `:sequence` (e.g. a string) coerces to NaN
+  under cljs's loose `<=`, and NaN compares false against everything, which
+  silently disables the rollback guard rather than rejecting the write."
+  [x]
+  (and (number? x) (= x x)))
+
 (defn head-response
   "Pure formatting for a `head` read: `record` is whatever the caller's
   storage returned for the queried `:name` (already JSON-decoded), or nil
@@ -47,6 +57,12 @@
   (cond
     (not (:valid? (ipns/verify-head body)))
     {:ok false :error "InvalidSignature" :status 401}
+
+    (not (valid-sequence? (:sequence body)))
+    {:ok false :error "InvalidSequence" :status 400}
+
+    (and current (not (valid-sequence? (:sequence current))))
+    {:ok false :error "InvalidSequence" :status 400}
 
     (and current (<= (:sequence body) (:sequence current)))
     {:ok false :error "SequenceRollback" :status 409}
