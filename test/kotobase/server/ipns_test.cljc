@@ -52,3 +52,26 @@
     (let [tampered (assoc (signed 1) :sequence 999)]
       (is (= {:ok false :error "InvalidSignature" :status 401}
              (sipns/verify-and-decide-publish tampered (signed 4)))))))
+
+(deftest verify-and-decide-publish-rejects-a-non-numeric-body-sequence
+  (testing "a validly-signed record with a non-numeric :sequence (e.g. a
+            string) must NOT reach the <= rollback comparison -- under
+            cljs, a non-numeric operand coerces to NaN, and NaN <= anything
+            is false, so a naive comparison would silently let this
+            through as 'not a rollback' instead of rejecting it"
+    (is (= {:ok false :error "InvalidSequence" :status 400}
+           (sipns/verify-and-decide-publish (signed "abc") nil))
+        "no existing record -- still rejected on the body's own bad :sequence")
+    (is (= {:ok false :error "InvalidSequence" :status 400}
+           (sipns/verify-and-decide-publish (signed "abc") (signed 999)))
+        "existing record has a much higher sequence -- would have silently
+         passed as 'no rollback' under NaN <= 999 without the guard")))
+
+(deftest verify-and-decide-publish-rejects-when-current-has-a-corrupted-sequence
+  (testing "if a previously-accepted record already has a non-numeric
+            :sequence (e.g. from before this guard existed), any further
+            publish is rejected rather than silently comparing against
+            NaN forever -- fails closed instead of permanently disabling
+            the rollback guard for this name"
+    (is (= {:ok false :error "InvalidSequence" :status 400}
+           (sipns/verify-and-decide-publish (signed 1) (signed "abc"))))))
