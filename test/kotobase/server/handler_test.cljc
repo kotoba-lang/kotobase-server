@@ -264,7 +264,18 @@
       (step store "indexRange" {:graph "g5" :attr ":score" :start_edn "\"15\""} nil
             (fn [resp]
               (is (:ok resp))
-              (is (= 2 (count (:datoms resp))) "unbounded end -> e2,e3 (score>=15)")))])))
+              (is (= 2 (count (:datoms resp))) "unbounded end -> e2,e3 (score>=15)")))
+      (step store "indexRange" {:graph "g5" :attr ":score" :start_edn "15"} nil
+            (fn [resp]
+              (is (not (:ok resp)))
+              (is (= "InternalError" (:error resp)))
+              "a bare (non-string) start_edn edn/read-strings to a NUMBER,
+               which `compare`s against the stored STRING and throws
+               SYNCHRONOUSLY, before do-index-range ever reaches its own
+               then*/hot-datoms call -- regression coverage for `handle`'s
+               own cljs Promise-contract gap on that path (previously
+               untested: a plain map instead of a Promise, breaking every
+               caller's `.then`)"))])))
 
 (deftest tx-tx-range-log-sync
   (let [store (mem-store)]
@@ -286,6 +297,34 @@
       (step store "sync" {:graph "g6" :t 99} nil
             (fn [resp] (is (:ok resp)) (is (false? (:caught_up resp)))
               "an unreached t is reported honestly, not blocked on"))])))
+
+(deftest tx-range-log-sync-reject-non-integer-bounds
+  (testing "a non-integer :start/:end/:t must be REJECTED, not silently
+            read as 'nothing in range'/'not caught up' -- in cljs, bare
+            `>=`/`<` compile to native JS relational operators, and
+            `(>= 5 \"abc\")` is `false` (no throw), the same silently-
+            wrong-not-rejected shape as the already-fixed do-q bug"
+    (let [store (mem-store)]
+      (run-async
+       [(step store "transact" {:graph "g7" :tx_edn "[{:db/id \"e1\" :n 1}]"} "did:key:ztest"
+              (fn [tx] (is (:ok tx))))
+        (step store "txRange" {:graph "g7" :start "abc" :end 1} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))
+        (step store "txRange" {:graph "g7" :start 0 :end "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))
+        (step store "log" {:graph "g7" :start "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))
+                "do-log is a direct alias of do-tx-range -- same guard applies"))
+        (step store "sync" {:graph "g7" :t "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))]))))
 
 (deftest do-q-routes-datalog-map-queries-to-the-right-engine
   (let [store (mem-store)]
