@@ -152,6 +152,81 @@
   [store chain]
   (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)))
 
+;; ── query-literal normalization (wire symmetry with tx-edn->quads) ──────────
+;; The write path stringifies EVERY non-Link datom position before it reaches
+;; the engine (`tx-edn->quads` above: `(str a)` / `(str v)` -- a transacted
+;; `:gh.genko/title` is STORED as the string ":gh.genko/title", `:status
+;; :draft` as ":draft", `:score 10` as "10"). The read path previously passed
+;; `query_edn`'s parsed literals through to arrangement UNCHANGED, where
+;; matching is plain `=` -- so a natural Datomic-style query written with
+;; keyword attributes (`[?e :gh.genko/title ?t]`) compared a KEYWORD against
+;; the stored STRING, matched nothing, and returned `{:ok true :rows []}`:
+;; success-shaped silence for correctly-written queries over data `datoms`
+;; plainly showed (confirmed live against backend.kotobase.net, 2026-07-09;
+;; the smoke tests never caught it because they all pre-stringify attrs,
+;; `":yoro.post/text"`). These fns close that asymmetry at the SAME layer
+;; that created it: every query literal in a datom position is coerced with
+;; the write side's own `(str x)` before it reaches the engine.
+;;
+;; What is deliberately NOT coerced:
+;;   - logic vars (`?x`) / the wildcard `_` / nil -- pattern syntax, not data
+;;   - strings -- already the stored representation ((str s) = s anyway)
+;;   - collections -- `["ipld/link" cid]` (a Link's wire form) and any other
+;;     structured literal keep today's behavior; Link-valued query matching
+;;     is a separate, pre-existing gap this change doesn't paper over
+;;   - predicate/function clause args (`[(> ?n 18)]`) -- those evaluate over
+;;     already-bound values, they are not matched against stored datoms
+
+(defn- lvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- wire-literal
+  "One query literal -> the engine's stored representation (the write
+  side's own `(str x)` coercion). Pattern syntax (lvars/`_`/nil), strings,
+  and collections pass through unchanged -- see the section comment."
+  [x]
+  (if (or (nil? x) (string? x) (coll? x) (lvar? x) (= '_ x))
+    x
+    (str x)))
+
+(defn- normalize-clause
+  "Normalize the datom-position literals of ONE `:where`/rule-body clause,
+  preserving `arrangement.datalog`'s clause taxonomy exactly: triple
+  patterns, `(not [e a v])`, `(or ...)`/`(or-join [vars] ...)` branches,
+  and rule-invocation args are coerced; predicate/function clauses
+  (`[(fn-sym arg...)]`, distinguished the same way arrangement does -- a
+  vector whose first element is a seq) are left untouched."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) clause
+    (vector? clause) (mapv wire-literal clause)
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head)     (list 'not (normalize-clause (first more)))
+        (= 'or head)      (cons 'or (map normalize-clause more))
+        (= 'or-join head) (list* 'or-join (first more) (map normalize-clause (rest more)))
+        :else             (cons head (map wire-literal more))))
+    :else clause))
+
+(defn- normalize-rule
+  "`[(rule-name ?param ...) body-clause ...]` -- the head (params are
+  lvars by construction) stays; body clauses normalize like `:where`'s."
+  [rule]
+  (into [(first rule)] (map normalize-clause (rest rule))))
+
+(defn normalize-query-literals
+  "Coerce every datom-position literal of a parsed `query_edn` (either
+  shape: `[s p o]` triple pattern or `{:find ... :where ... :rules ...}`
+  Datalog map) to the stored string representation -- see the section
+  comment above. Public + pure so the symmetry with `tx-edn->quads` is
+  directly unit-testable."
+  [pat]
+  (if (map? pat)
+    (cond-> pat
+      (:where pat) (update :where #(mapv normalize-clause %))
+      (:rules pat) (update :rules #(mapv normalize-rule %)))
+    (mapv wire-literal pat)))
+
 (defn do-q
   "`datomic.q` -- routes to ONE of two engines depending on `query_edn`'s
   shape: a plain `[s p o]` vector (nil = wildcard) is a triple-pattern
@@ -169,15 +244,22 @@
   shape today. body: {:graph :query_edn :inputs_edn} -- `inputs_edn`
   (optional) is an EDN vector matching `query_edn`'s own `:in` clause
   order, for the Datalog form only (see `eng/query`'s docstring); ignored
-  for a triple-pattern query."
+  for a triple-pattern query.
+
+  Both query shapes (and `inputs_edn`'s scalar values) pass through
+  `normalize-query-literals` first, so a query written the natural
+  Datomic way (keyword attributes, keyword/number value literals) matches
+  the stringified representation the write path actually stored -- see
+  the normalization section comment above for the live bug this fixes."
   [store {:keys [graph query_edn inputs_edn]}]
   (let [chain ((:head-get store) graph)
-        pat (edn/read-string query_edn)]
+        pat (normalize-query-literals (edn/read-string query_edn))]
     (then* (hot-db store chain)
            (fn [db]
              (let [rows (if (and (map? pat) (or (contains? pat :find) (contains? pat :where)))
                           (if inputs_edn
-                            (eng/query db pat (constantly true) (edn/read-string inputs_edn))
+                            (eng/query db pat (constantly true)
+                                       (mapv wire-literal (edn/read-string inputs_edn)))
                             (eng/query db pat (constantly true)))
                           (eng/q db pat (constantly true)))]
                {:ok true :graph graph :rows (vec rows)})))))
