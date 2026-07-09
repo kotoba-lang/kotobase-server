@@ -308,3 +308,89 @@
               "map-shaped query_edn now actually routes to eng/query (the real
                Datalog engine) instead of being silently mistreated as an
                empty/malformed triple pattern"))])))
+
+;; ── query-literal normalization (the live "q sees nothing datoms sees"
+;; bug, confirmed against backend.kotobase.net 2026-07-09): the write path
+;; stores every non-Link position stringified (tx-edn->quads, `(str v)`),
+;; so a query written the natural Datomic way -- keyword attributes,
+;; keyword/number value literals -- previously compared a keyword/number
+;; against the stored string, matched nothing, and returned ok+empty rows.
+
+(deftest do-q-normalizes-keyword-and-number-literals-to-the-stored-strings
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact"
+            {:graph "g8"
+             :tx_edn "[{:db/id \"w1\" :gh.genko/title \"First\" :gh.genko/status :draft :gh.genko/rev 3} {:db/id \"w2\" :gh.genko/title \"Second\" :gh.genko/status :done :gh.genko/rev 7}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "q" {:graph "g8" :query_edn "[nil :gh.genko/title nil]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:rows resp)))
+                  "triple pattern with a KEYWORD attribute now matches the stored string attr")))
+      (step store "q" {:graph "g8" :query_edn "{:find [?e ?t] :where [[?e :gh.genko/title ?t]]}"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["w1" "First"] ["w2" "Second"]} (set (:rows resp)))
+                  "Datalog clause with a KEYWORD attribute now matches")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/status :draft] [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "a KEYWORD value literal matches the stored \":draft\" string")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/rev 7] [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["Second"]} (set (:rows resp)))
+                  "a NUMBER value literal matches the stored \"7\" string")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :in [?s] :where [[?e :gh.genko/status ?s] [?e :gh.genko/title ?t]]}"
+                        :inputs_edn "[:done]"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["Second"]} (set (:rows resp)))
+                  "a KEYWORD input (:in binding) is coerced the same way")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/title ?t] (not [?e :gh.genko/status :done])]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "literals inside (not [...]) are normalized too")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :rules [[(drafted ?e) [?e :gh.genko/status :draft]]] :where [(drafted ?e) [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "literals inside :rules bodies are normalized too")))
+      ;; unchanged behavior: string-literal queries (every existing caller)
+      (step store "q" {:graph "g8" :query_edn "[nil \":gh.genko/title\" nil]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:rows resp))) "pre-existing string-attr form still works")))])))
+
+(deftest normalize-query-literals-is-precise-about-what-it-touches
+  (testing "pattern syntax and structured literals pass through untouched"
+    (is (= [nil ":a/b" nil] (h/normalize-query-literals [nil :a/b nil])))
+    (is (= '{:find [?e] :where [[?e ":x" "s"] [(> ?n 18)] [(str ?a ?b) ?c]]}
+           (h/normalize-query-literals
+            '{:find [?e] :where [[?e :x "s"] [(> ?n 18)] [(str ?a ?b) ?c]]}))
+        "predicate/function clauses are NOT coerced -- they evaluate over
+         bound values, they aren't matched against stored datoms")
+    (is (= '{:where [[?e ":ref" ["ipld/link" "bafy..."]]]}
+           (h/normalize-query-literals '{:where [[?e :ref ["ipld/link" "bafy..."]]]}))
+        "collection literals (a Link's wire form) keep today's behavior")
+    (is (= '{:where [[?e ":x" ?v] (or [?v ":k" "1"] [?v ":k" "2"])]}
+           (h/normalize-query-literals
+            '{:where [[?e :x ?v] (or [?v :k 1] [?v :k 2])]}))
+        "or-branches are normalized; lvars stay lvars")
+    (is (= '{:where [(or-join [?v] [?v ":k" ":kw"])]}
+           (h/normalize-query-literals '{:where [(or-join [?v] [?v :k :kw])]}))
+        "or-join keeps its shared-vars vector, normalizes its branches")))
