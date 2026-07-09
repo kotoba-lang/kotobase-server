@@ -515,6 +515,22 @@
         entry (some #(when (= t (:seq %)) %) entries)]
     {:ok true :graph graph :t t :found (some? entry) :tx_cid (some-> entry :cid str)}))
 
+(defn- assert-integer-bound!
+  "Throws if `v` is present but not an integer. `>=`/`<`/`<=`/`>` compile
+  to native JS relational operators in cljs (unlike JVM Clojure's numeric
+  comparators, which throw a ClassCastException on a non-Number), and
+  JS's loose coercion makes e.g. `(>= 5 \"abc\")` silently `false` --
+  never a throw. Without this guard, a malformed :start/:end/:t here
+  would silently read as \"nothing in range\" / \"not caught up\" instead
+  of a clean rejection -- the same failure shape as the already-fixed
+  do-q wire-literal bug, just on a different endpoint. `handle`'s
+  existing try/catch turns this throw into a normal `{:ok false :error
+  \"InternalError\"}` response, same as do-index-range's own `edn/read-
+  string` throwing on a malformed start_edn/end_edn."
+  [k v]
+  (when (and (some? v) (not (integer? v)))
+    (throw (ex-info (str (name k) " must be an integer, got " (pr-str v)) {k v}))))
+
 (defn do-tx-range
   "`datomic.txRange` -- commit metadata for every `:seq` in `[start,
   end)` (Datomic's own txRange semantics: start inclusive, end exclusive;
@@ -522,6 +538,8 @@
   :start :end :limit}. Same per-tx-datom-content limitation as
   `datomic.tx` above. Pure/sync, same reasoning as `do-basis-t`."
   [store {:keys [graph start end limit]}]
+  (assert-integer-bound! :start start)
+  (assert-integer-bound! :end end)
   (let [chain-cid ((:head-get store) graph)
         entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
         in-range? (fn [{:keys [seq]}]
@@ -553,6 +571,7 @@
   treat this as a real async wait primitive. body: {:graph :t}. Pure/
   sync, same reasoning as `do-basis-t`."
   [store {:keys [graph t]}]
+  (assert-integer-bound! :t t)
   (let [chain-cid ((:head-get store) graph)
         entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
         current-t (:seq (last entries))]
@@ -627,4 +646,14 @@
         #?(:clj resp
            :cljs (.catch (js/Promise.resolve resp) err)))
       (catch #?(:clj Exception :cljs :default) e
-        (err e)))))
+        ;; A do-* fn that throws SYNCHRONOUSLY (before ever returning a
+        ;; value/Promise -- e.g. do-index-range's edn/read-string on a
+        ;; malformed start_edn, or assert-integer-bound!'s guard below)
+        ;; skips the `case` result entirely and lands here, bypassing the
+        ;; `.catch (js/Promise.resolve resp) ...` wrapping above. Without
+        ;; this being Promise-wrapped too, `handle` would return a PLAIN
+        ;; map on this path instead of the Promise every cljs caller's
+        ;; `.then` assumes `handle` always returns -- `TypeError:
+        ;; ...handle(...).then is not a function`, not a clean error.
+        #?(:clj (err e)
+           :cljs (js/Promise.resolve (err e)))))))
