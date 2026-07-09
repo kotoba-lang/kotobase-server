@@ -22,10 +22,16 @@ drifting copies.
 ## What's here
 
 ```
-kotobase.server.handler      -- pure XRPC dispatch (do-datoms/do-transact/
-                                 do-q/do-pull/do-fold), a function of an
+kotobase.server.handler      -- pure XRPC dispatch, a function of an
                                  injected `store` map (get-fn/put!/head-get/
-                                 head-put!/blind-fn/encrypt-fn/decrypt-fn)
+                                 head-put!/blind-fn/encrypt-fn/decrypt-fn).
+                                 21 methods total:
+                                   -- original 5: datoms/transact/q/pull/fold
+                                   -- Datomic Cloud-style read helpers added
+                                      since: entity/entid/ident/asOf/since/
+                                      history/basisT/dbStats/seekDatoms/
+                                      indexRange/indexPull/pullMany/tx/
+                                      txRange/log/sync
 kotobase.server.trampoline    -- with-blocks: bridges any async block store
                                  (R2, B2, IndexedDB, ...) to kotobase-peer's
                                  synchronous get-fn contract, fetching only
