@@ -2,12 +2,21 @@
  ;; kotobase-server -- platform-independent XRPC handler + async/sync storage
  ;; bridge for a kotobase-peer-backed worker. No deploy surface, no
  ;; Cloudflare/R2/B2-specific code -- see README.md.
+ ;; kotobase-peer pin: picks up arrangement's truncated-CBOR-input fix
+ ;; (kotobase-peer#14, propagated from io-ipld/org-ietf-cbor) -- this
+ ;; handler decodes untrusted bytes via kotobase-peer's engine calls
+ ;; (hot-datoms/commit!/fold!), same vulnerable decode path.
+ ;; kotobase-client pin: picks up kotobase.cid/did-key->ed25519-pub's
+ ;; fail-closed fix (returns nil, not a throw, on malformed base58) --
+ ;; kotobase.server.ipns requires kotobase.ipns (kotobase-client), whose
+ ;; verify-head calls did-key->ed25519-pub directly to resolve the
+ ;; signer's pubkey for every IPNS record signature check.
  :deps {io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "21afdc04caf8ab5a9785cf931f7eaf5d858ecac1"}
+         :git/sha "40975bfb1dd79d1133b4752028104872d40aa958"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
-         :git/sha "ac7fe263e65eeb129bac63c5ea243b2e75254cd4"}}
+         :git/sha "a1799ffaa20557ba9b3eb956d4978c865734aa49"}}
  :aliases
  {:cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "2.28.20"}}}
   :test-node
