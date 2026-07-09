@@ -33,3 +33,17 @@ jobs:
 
       - run: npm install
       - run: npm run test:cljs
+
+  lint:
+    name: clj-kondo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - run: clojure -M:lint
