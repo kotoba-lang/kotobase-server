@@ -96,6 +96,54 @@
             (.then (fn [_] (done)))
             (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
 
+(deftest transact-accepts-db-add-list-form
+  (testing "standard Datomic list-form [:db/add e a v] tuples -- NOT just
+           map-form entities -- e.g. cloud-murakumo.queue-kotoba's
+           job->tx/event->tx build tx_edn exclusively out of these; before
+           this fix every such transact hit tx-edn->quads's :else branch
+           (\"unrecognized tx_edn item\"), surfaced by `handle`'s outer
+           try/catch as a generic {:ok false :error \"InternalError\"} with
+           no indication of the real cause"
+    (let [store (mem-store)]
+      #?(:clj
+         (run-steps
+          [(fn []
+             (let [tx (h/handle store "transact"
+                                 {:graph "g2"
+                                  :tx_edn "[[:db/add \"e1\" :gen.job/id \"job-1\"] [:db/add \"e1\" :gen.job/status :queued]]"}
+                                 "did:key:ztest")]
+               (is (:ok tx))
+               (is (= 2 (:datom_count tx)))))
+           (fn []
+             (let [datoms (h/handle store "datoms" {:graph "g2"} nil)]
+               (is (:ok datoms))
+               (is (= 2 (count (:datoms datoms))))
+               (is (some #(= ":gen.job/id" (:a %)) (:datoms datoms)))
+               (is (some #(= ":gen.job/status" (:a %)) (:datoms datoms)))))])
+         :cljs
+         (async
+          done
+          (-> (run-steps
+               [(fn [] (.then (h/handle store "transact"
+                                       {:graph "g2"
+                                        :tx_edn "[[:db/add \"e1\" :gen.job/id \"job-1\"] [:db/add \"e1\" :gen.job/status :queued]]"}
+                                       "did:key:ztest")
+                              (fn [tx]
+                                (is (:ok tx))
+                                (is (= 2 (:datom_count tx))))))
+                (fn [] (.then (h/handle store "datoms" {:graph "g2"} nil)
+                              (fn [datoms]
+                                (is (:ok datoms))
+                                (is (= 2 (count (:datoms datoms)))))))])
+              (.then (fn [_] (done)))
+              (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))))
+
+(deftest tx-edn->quads-db-add-matches-map-form-shape
+  (testing "list-form and map-form produce the same {:s :p :o} quad shape
+           for equivalent data (no :op key on either -- that's retract-only)"
+    (is (= (h/tx-edn->quads "[{:db/id \"e1\" :ns/attr \"v\"}]")
+           (h/tx-edn->quads "[[:db/add \"e1\" :ns/attr \"v\"]]")))))
+
 (deftest unknown-method-is-clean-error
   (let [store (mem-store)]
     #?(:clj

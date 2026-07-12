@@ -52,19 +52,34 @@
 
 (defn tx-edn->quads
   "Parse a kotobase `tx_edn` string -- a vector of entity maps
-  `[{:db/id \"e\" :ns/attr v …} …]` -- into `{:s :p :o}` quads. Datafication
+  `[{:db/id \"e\" :ns/attr v …} …]` OR standard Datomic list-form assertions
+  `[:db/add e a v]` -- into `{:s :p :o}` quads. Datafication of the map form
   goes through the engine's canonical datom model (`eng/entities->datoms` =
   `datom.core/eavt`), the SAME `[e a v]` representation kgraph (kotoba's
   in-mem view) speaks -- ONE shared datom model across transport, DB, and
-  language (ADR-2607032500). Reads the whole string as EDN (no
-  brace-splitting) so map/vector values with literal braces are safe.
-  `(str :ns/attr)` keeps the leading ':' -- PDS datom consumers key on
+  language (ADR-2607032500). List-form `:db/add` already IS an `[e a v]`
+  triple, so it's stringified the same way `(str e)`/`(str a)`/`(str v)`
+  without a round-trip through `entities->datoms`. Reads the whole string as
+  EDN (no brace-splitting) so map/vector values with literal braces are
+  safe. `(str :ns/attr)` keeps the leading ':' -- PDS datom consumers key on
   \":ns/attr\".
 
   Retraction forms ride the same tx_edn vector: `[:db/retract e a v]` -> an
   :op :retract quad, `[:db/retractEntity e]` -> an :op :retract-entity quad
   -- dispatched BEFORE eavt (which is the pure entity-map->[e a v] datafier
-  and stays map-only)."
+  and stays map-only).
+
+  `:db/cas` (compare-and-swap) is deliberately NOT supported here -- CAS
+  needs an atomicity guarantee this engine's append-only novelty-block write
+  (`do-transact`, O(|tx|), no read-check) does not provide; a caller relying
+  on `:db/cas` (e.g. cloud-murakumo's worker job-claim race) gets the same
+  `unrecognized tx_edn item` rejection :db/add used to get, not silent
+  non-atomic best-effort semantics -- confirmed 2026-07-12 while diagnosing
+  every cloud-murakumo.queue-kotoba write returning a generic 400
+  \"InternalError\" (this fn's own `:else` throw, swallowed by `handle`'s
+  outer try/catch): queue-kotoba's job->tx/event->tx build plain `:db/add`
+  list-form tuples, which this fn rejected outright before this fix -- ANY
+  transact from that client failed, not just CAS-shaped ones."
   [tx-edn]
   (mapcat (fn [item]
             (cond
@@ -74,6 +89,10 @@
 
               (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
               [{:s (str (second item)) :op :retract-entity}]
+
+              (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+              (let [[_ e a v] item]
+                [{:s (str e) :p (str a) :o (str v)}])
 
               (map? item)
               (map (fn [[e a v]] {:s (str e) :p (str a) :o (str v)})
