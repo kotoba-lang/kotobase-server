@@ -481,3 +481,43 @@
     (is (= '{:where [(or-join [?v] [?v ":k" ":kw"])]}
            (h/normalize-query-literals '{:where [(or-join [?v] [?v :k :kw])]}))
         "or-join keeps its shared-vars vector, normalizes its branches")))
+
+;; ── blob surface (ADR-2607175000: DataLad/git-annex content-addressed 永続化) ──
+
+(deftest blob-put-get-head-roundtrip
+  (testing "blob-put で保存 → head present → get で bytes 復元（datom 面と独立）"
+    (let [store (mem-store)
+          key "SHA256E-s3--abc"
+          bytes "BYTES"]
+      (is (= {:ok true :key key} (h/handle-blob store "put" key bytes "did:example:owner")))
+      (is (= {:ok true :key key :present true} (h/handle-blob store "head" key nil nil)))
+      (is (= {:ok true :key key :data bytes} (h/handle-blob store "get" key nil nil))))))
+
+(deftest blob-head-absent
+  (let [store (mem-store)]
+    (is (= {:ok true :key "K" :present false} (h/handle-blob store "head" "K" nil nil)))
+    (is (= "NotFound" (:error (h/handle-blob store "get" "K" nil nil))))))
+
+(deftest blob-remove-tombstones-then-reput-clears
+  (testing "REMOVE で present=false（immutable block は残るが tombstone）、再 PUT で解除"
+    (let [store (mem-store)
+          key "SHA256E-s1--z"]
+      (h/handle-blob store "put" key "v" "did:owner")
+      (is (:present (h/handle-blob store "head" key nil nil)))
+      (h/handle-blob store "remove" key nil "did:owner")
+      (is (not (:present (h/handle-blob store "head" key nil nil))) "removed → absent")
+      (is (= "NotFound" (:error (h/handle-blob store "get" key nil nil))))
+      (h/handle-blob store "put" key "v2" "did:owner")
+      (is (:present (h/handle-blob store "head" key nil nil)) "re-put clears tombstone")
+      (is (= "v2" (:data (h/handle-blob store "get" key nil nil)))))))
+
+(deftest blob-writes-require-auth
+  (testing "put/remove は auth-did 無しで Unauthorized、get/head は auth 不要"
+    (let [store (mem-store)]
+      (is (= "Unauthorized" (:error (h/handle-blob store "put" "K" "v" nil))))
+      (is (= "Unauthorized" (:error (h/handle-blob store "remove" "K" nil nil))))
+      ;; auth 無しでも read は通る
+      (is (= false (:present (h/handle-blob store "head" "K" nil nil)))))))
+
+(deftest blob-unknown-op
+  (is (= "MethodNotImplemented" (:error (h/handle-blob (mem-store) "frob" "K" nil "did:x")))))
