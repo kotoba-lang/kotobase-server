@@ -582,6 +582,61 @@
                ((:head-put! store) graph new-chain)
                {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n})))))
 
+;; ── blob surface ─────────────────────────────────────────────────────────────
+;; git-annex / DataLad の content-addressed 大容量バイナリ永続化面（ADR-2607175000）。
+;; datom 面（JSON body、`handle`）とは分離し、**raw bytes** を扱う。store の
+;; put!/get-fn/head をそのまま公開する薄いラッパ:
+;;   blob-put/remove  は書き込みなので auth-did（CACAO 検証済み）を要求。
+;;   blob-get/head    は読みで auth 不要。
+;; block は content-addressed で **immutable**（delete が store 契約に無い）ため、
+;; REMOVE は tombstone head で表現する（put! で再投入すると tombstone は解除）。
+;; key は git-annex key（SHA256E-s<size>--<hash>）で、そのまま block cid に使う。
+
+(defn- blob-tomb [key] (str "blob-tomb:" key))
+
+(defn- blob-present?
+  "key が present か（block があり、かつ tombstone が無い）。"
+  [store key]
+  (and (some? ((:get-fn store) key))
+       (nil? ((:head-get store) (blob-tomb key)))))
+
+(defn do-blob-put
+  "raw bytes を key（=cid）で保存。tombstone があれば解除（再投入）。auth 必須。"
+  [store key bytes _auth-did]
+  ((:put! store) key bytes)
+  ((:head-put! store) (blob-tomb key) nil)
+  {:ok true :key key})
+
+(defn do-blob-get
+  "key の bytes を返す（present でなければ NotFound）。"
+  [store key]
+  (if (blob-present? store key)
+    {:ok true :key key :data ((:get-fn store) key)}
+    {:ok false :error "NotFound" :key key}))
+
+(defn do-blob-head
+  "key の present 判定（bytes を転送しない CHECKPRESENT 用）。"
+  [store key]
+  {:ok true :key key :present (blob-present? store key)})
+
+(defn do-blob-remove
+  "key を tombstone で不在化（immutable block は残すが present? は false に）。auth 必須。"
+  [store key _auth-did]
+  ((:head-put! store) (blob-tomb key) "removed")
+  {:ok true :key key})
+
+(defn handle-blob
+  "blob 面の dispatch。`op` は put|get|head|remove、`bytes` は put 時のみ。
+   auth-did は CACAO 検証済み issuer（put/remove は nil だと Unauthorized）。"
+  [store op key bytes auth-did]
+  (letfn [(need-auth [] (when-not auth-did {:ok false :error "Unauthorized" :key key}))]
+    (case op
+      "put"    (or (need-auth) (do-blob-put store key bytes auth-did))
+      "get"    (do-blob-get store key)
+      "head"   (do-blob-head store key)
+      "remove" (or (need-auth) (do-blob-remove store key auth-did))
+      {:ok false :error "MethodNotImplemented" :op op})))
+
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
 (defn handle
