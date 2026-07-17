@@ -34,7 +34,8 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
-            [kotobase-peer.core :as eng]))
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.policy :as policy]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -114,6 +115,44 @@
 (defn- index-kw [index]
   (when (seq index) (keyword (cond-> index (str/starts-with? index ":") (subs 1)))))
 
+(defn- visible-of
+  "The per-request row filter `handle` computed from (graph policy × viewer
+  CACAO capabilities), ADR-2607174500 Phase 3b; absent (writes, tests
+  calling do-* directly) → fully public, the pre-Phase-3 behavior."
+  [store]
+  (or (:visible? store) (constantly true)))
+
+(defn- visible-attr? [store attr]
+  ((visible-of store) {:a (str attr)}))
+
+(defn- redact-pulled
+  "Attr-level redaction over eng/pull / eng/entity result trees — those
+  read a hydrated db VALUE and bypass the row-level visible? seam, so the
+  handler filters their attr-keyed maps (recursively: nested pull
+  patterns return nested attr maps)."
+  [store v]
+  (cond
+    (map? v) (into {} (keep (fn [[k vv]]
+                              (when (visible-attr? store k)
+                                [k (redact-pulled store vv)]))
+                            v))
+    (set? v) (into #{} (map #(redact-pulled store %)) v)
+    (sequential? v) (mapv #(redact-pulled store %) v)
+    :else v))
+
+(defn- request-visible?
+  "policy entity の 1 narrow read × viewer caps → visible? (ADR-2607174500)。
+  nil chain → public. Promise on cljs."
+  [store caps]
+  (fn [graph]
+    (let [chain ((:head-get store) graph)]
+      (if (nil? chain)
+        #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+        (then* (eng/hot-datoms (:get-fn store) chain
+                               {:index :eavt :components [policy/policy-entity]}
+                               (constantly true) (:blind-fn store) (:decrypt-fn store))
+               (fn [rows] (policy/visible-for (policy/policy-of rows) caps)))))))
+
 (defn do-datoms
   "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
   merge, range-pruned on the snapshot side; never a whole-graph rehydrate).
@@ -129,7 +168,7 @@
                            {:index (or (index-kw index) :eavt)
                             :components (vec components_edn)
                             :limit limit}
-                           (constantly true) (:blind-fn store) (:decrypt-fn store))
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
            (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
 (defn do-transact
@@ -277,10 +316,10 @@
            (fn [db]
              (let [rows (if (and (map? pat) (or (contains? pat :find) (contains? pat :where)))
                           (if inputs_edn
-                            (eng/query db pat (constantly true)
+                            (eng/query db pat (visible-of store)
                                        (mapv wire-literal (edn/read-string inputs_edn)))
-                            (eng/query db pat (constantly true)))
-                          (eng/q db pat (constantly true)))]
+                            (eng/query db pat (visible-of store)))
+                          (eng/q db pat (visible-of store)))]
                {:ok true :graph graph :rows (vec rows)})))))
 
 (defn do-pull
@@ -308,10 +347,10 @@
           pattern (edn/read-string pattern_edn)]
       (then* (hot-db store chain)
              (fn [db] {:ok true :graph graph :entity entity
-                       :result_edn (pr-str (eng/pull db entity pattern))})))
+                       :result_edn (pr-str (redact-pulled store (eng/pull db entity pattern)))})))
     (let [chain ((:head-get store) graph)]
       (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                             (constantly true) (:blind-fn store) (:decrypt-fn store))
+                             (visible-of store) (:blind-fn store) (:decrypt-fn store))
              (fn [rows]
                {:ok true :graph graph :entity entity
                 :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))
@@ -327,7 +366,7 @@
     (then* (hot-db store chain)
            (fn [db]
              {:ok true :graph graph
-              :results_edn (mapv #(pr-str (eng/pull db % pattern)) entities)}))))
+              :results_edn (mapv #(pr-str (redact-pulled store (eng/pull db % pattern))) entities)}))))
 
 (defn do-index-pull
   "`datomic.indexPull` -- Datomic's index-based pull, a comparatively
@@ -355,7 +394,7 @@
   (let [chain ((:head-get store) graph)]
     (then* (hot-db store chain)
            (fn [db] {:ok true :graph graph :entity entity
-                     :entity_edn (pr-str (eng/entity db entity))}))))
+                     :entity_edn (pr-str (redact-pulled store (eng/entity db entity)))}))))
 
 (defn do-entid
   "`datomic.entid` -- resolve an id-or-ident to the actual entity id
@@ -398,7 +437,7 @@
                            {:index (or (index-kw index) :eavt)
                             :components (vec components_edn)
                             :limit limit}
-                           (constantly true) (:blind-fn store) (:decrypt-fn store))
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
            (fn [rows] {:ok true :graph graph :t t :datoms (vec rows)}))))
 
 (defn do-since
@@ -410,7 +449,7 @@
   (let [chain ((:head-get store) graph)]
     (then* (eng/since (:get-fn store) chain t (:decrypt-fn store))
            (fn [db] {:ok true :graph graph :t t
-                     :datoms (vec (eng/datoms db (constantly true)))}))))
+                     :datoms (vec (eng/datoms db (visible-of store)))}))))
 
 (defn do-history
   "`datomic.history` -- the full audit-log view: every quad EVER asserted
@@ -425,7 +464,7 @@
   content with no individual assert event."
   [store {:keys [graph entity]}]
   (let [chain ((:head-get store) graph)]
-    (then* (eng/history-datoms (:get-fn store) chain entity (constantly true) (:decrypt-fn store))
+    (then* (eng/history-datoms (:get-fn store) chain entity (visible-of store) (:decrypt-fn store))
            (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
 (defn do-basis-t
@@ -506,7 +545,7 @@
         start (some-> start_edn edn/read-string)
         end (some-> end_edn edn/read-string)]
     (then* (eng/hot-datoms (:get-fn store) chain {:index :avet :components [attr]}
-                           (constantly true) (:blind-fn store) (:decrypt-fn store))
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
            (fn [rows]
              (let [in-range? (fn [{:keys [v_edn]}]
                                 (let [v (edn/read-string v_edn)]
@@ -680,54 +719,66 @@
 (defn handle
   "Dispatch a parsed XRPC call. `method` is the NSID suffix after
   `ai.gftd.apps.kotobase.datomic.`; `body` is the keywordized JSON body;
-  `auth-did` is the CACAO-verified issuer or nil. Returns a plain response
-  map; never throws for a known method (errors become `{:ok false :error
-  …}`) EXCEPT a storage-layer block-miss (`kotobase.server.trampoline`'s
+  `auth` is the CACAO-verified issuer DID (string, legacy) or an
+  {:did :resources} map (ADR-2607174500 — resources carry the viewer's
+  capability strings for read redaction). Returns a plain response map;
+  never throws for a known method (errors become `{:ok false :error …}`)
+  EXCEPT a storage-layer block-miss (`kotobase.server.trampoline`'s
   `:block-miss` marker), which re-throws so the caller's trampoline sees it
   and retries -- swallowing it here would surface as a spurious
   InternalError instead."
-  [store method body auth-did]
+  [store method body auth]
   (letfn [(err [e]
             (if (:block-miss (ex-data e))
               (throw e)
               {:ok false :error "InternalError"
                :message #?(:clj (.getMessage ^Exception e)
-                           :cljs (or (ex-message e) (.-message e)))}))]
+                           :cljs (or (ex-message e) (.-message e)))}))
+          (dispatch [store]
+            (let [auth-did (if (map? auth) (:did auth) auth)]
+              (case method
+                "datoms"      (do-datoms store body)
+                "transact"    (do-transact store body auth-did)
+                "q"           (do-q store body)
+                "pull"        (do-pull store body)
+                "pullMany"    (do-pull-many store body)
+                "indexPull"   (do-index-pull store body)
+                "fold"        (do-fold store body)
+                "entity"      (do-entity store body)
+                "entid"       (do-entid store body)
+                "ident"       (do-ident store body)
+                "asOf"        (do-as-of store body)
+                "since"       (do-since store body)
+                "history"     (do-history store body)
+                "basisT"      (do-basis-t store body)
+                "dbStats"     (do-db-stats store body)
+                "seekDatoms"  (do-seek-datoms store body)
+                "indexRange"  (do-index-range store body)
+                "tx"          (do-tx store body)
+                "txRange"     (do-tx-range store body)
+                "log"         (do-log store body)
+                "sync"        (do-sync store body)
+                {:ok false :error "MethodNotImplemented" :method method})))]
     (try
-      (let [resp (case method
-                   "datoms"      (do-datoms store body)
-                   "transact"    (do-transact store body auth-did)
-                   "q"           (do-q store body)
-                   "pull"        (do-pull store body)
-                   "pullMany"    (do-pull-many store body)
-                   "indexPull"   (do-index-pull store body)
-                   "fold"        (do-fold store body)
-                   "entity"      (do-entity store body)
-                   "entid"       (do-entid store body)
-                   "ident"       (do-ident store body)
-                   "asOf"        (do-as-of store body)
-                   "since"       (do-since store body)
-                   "history"     (do-history store body)
-                   "basisT"      (do-basis-t store body)
-                   "dbStats"     (do-db-stats store body)
-                   "seekDatoms"  (do-seek-datoms store body)
-                   "indexRange"  (do-index-range store body)
-                   "tx"          (do-tx store body)
-                   "txRange"     (do-tx-range store body)
-                   "log"         (do-log store body)
-                   "sync"        (do-sync store body)
-                   {:ok false :error "MethodNotImplemented" :method method})]
+      ;; ADR-2607174500 Phase 3b: resolve (graph policy × viewer caps) into
+      ;; the per-request visible? BEFORE dispatch for redaction-relevant
+      ;; reads; each read op consumes it via (visible-of store). Writes and
+      ;; metadata-only ops (tx/txRange/log/dbStats/basisT/sync/entid/ident —
+      ;; commit metadata and id mappings, no datom content) skip the extra
+      ;; narrow read entirely.
+      (let [caps (when (map? auth) (:resources auth))
+            visibility-methods #{"datoms" "q" "pull" "pullMany" "indexPull"
+                                 "entity" "asOf" "since" "history"
+                                 "seekDatoms" "indexRange"}
+            resp (if (and (contains? visibility-methods method) (:graph body))
+                   (then* ((request-visible? store caps) (:graph body))
+                          (fn [visible?] (dispatch (assoc store :visible? visible?))))
+                   (dispatch store))]
         #?(:clj resp
            :cljs (.catch (js/Promise.resolve resp) err)))
       (catch #?(:clj Exception :cljs :default) e
-        ;; A do-* fn that throws SYNCHRONOUSLY (before ever returning a
-        ;; value/Promise -- e.g. do-index-range's edn/read-string on a
-        ;; malformed start_edn, or assert-integer-bound!'s guard below)
-        ;; skips the `case` result entirely and lands here, bypassing the
-        ;; `.catch (js/Promise.resolve resp) ...` wrapping above. Without
-        ;; this being Promise-wrapped too, `handle` would return a PLAIN
-        ;; map on this path instead of the Promise every cljs caller's
-        ;; `.then` assumes `handle` always returns -- `TypeError:
-        ;; ...handle(...).then is not a function`, not a clean error.
+        ;; a do-* fn that throws SYNCHRONOUSLY lands here; Promise-wrap on
+        ;; cljs so every caller's .then keeps working (same reasoning as
+        ;; kotobase-cljc-worker's handle).
         #?(:clj (err e)
            :cljs (js/Promise.resolve (err e)))))))
