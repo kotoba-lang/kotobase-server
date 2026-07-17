@@ -140,18 +140,51 @@
     (sequential? v) (mapv #(redact-pulled store %) v)
     :else v))
 
+(defn- owned-entities
+  "Entity ids the viewer OWNS per the policy's :owner-attrs (Phase 3c,
+  ADR-2607174500 addendum 2): one narrow :avet [owner-attr viewer-did] scan
+  per owner attr. Empty when no owner-attrs / anonymous. Promise on cljs."
+  [store chain policy viewer-did]
+  (let [owner-attrs (:owner-attrs policy)]
+    (if (or (nil? chain) (empty? owner-attrs) (nil? viewer-did))
+      #?(:clj #{} :cljs (js/Promise.resolve #{}))
+      #?(:clj
+         (into #{}
+               (mapcat (fn [attr]
+                         (->> (eng/hot-datoms (:get-fn store) chain
+                                              {:index :avet :components [attr viewer-did]}
+                                              (constantly true) (:blind-fn store) (:decrypt-fn store))
+                              (map :e))))
+               owner-attrs)
+         :cljs
+         (-> (js/Promise.all
+              (into-array
+               (map (fn [attr]
+                      (eng/hot-datoms (:get-fn store) chain
+                                      {:index :avet :components [attr viewer-did]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)))
+                    owner-attrs)))
+             (.then (fn [^js lists]
+                      (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
+
 (defn- request-visible?
-  "policy entity の 1 narrow read × viewer caps → visible? (ADR-2607174500)。
+  "policy entity の 1 narrow read × viewer caps × (Phase 3c) 所有 entity →
+  visible? (ADR-2607174500)。`viewer` は auth map {:did :resources} or nil。
   nil chain → public. Promise on cljs."
-  [store caps]
-  (fn [graph]
-    (let [chain ((:head-get store) graph)]
-      (if (nil? chain)
-        #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
-        (then* (eng/hot-datoms (:get-fn store) chain
-                               {:index :eavt :components [policy/policy-entity]}
-                               (constantly true) (:blind-fn store) (:decrypt-fn store))
-               (fn [rows] (policy/visible-for (policy/policy-of rows) caps)))))))
+  [store viewer]
+  (let [caps (:resources viewer)
+        viewer-did (:did viewer)]
+    (fn [graph]
+      (let [chain ((:head-get store) graph)]
+        (if (nil? chain)
+          #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+          (then* (eng/hot-datoms (:get-fn store) chain
+                                 {:index :eavt :components [policy/policy-entity]}
+                                 (constantly true) (:blind-fn store) (:decrypt-fn store))
+                 (fn [rows]
+                   (let [policy (policy/policy-of rows)]
+                     (then* (owned-entities store chain policy viewer-did)
+                            (fn [owned] (policy/visible-for policy caps owned)))))))))))
 
 (defn do-datoms
   "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
@@ -766,12 +799,12 @@
       ;; metadata-only ops (tx/txRange/log/dbStats/basisT/sync/entid/ident —
       ;; commit metadata and id mappings, no datom content) skip the extra
       ;; narrow read entirely.
-      (let [caps (when (map? auth) (:resources auth))
+      (let [viewer (when (map? auth) auth)
             visibility-methods #{"datoms" "q" "pull" "pullMany" "indexPull"
                                  "entity" "asOf" "since" "history"
                                  "seekDatoms" "indexRange"}
             resp (if (and (contains? visibility-methods method) (:graph body))
-                   (then* ((request-visible? store caps) (:graph body))
+                   (then* ((request-visible? store viewer) (:graph body))
                           (fn [visible?] (dispatch (assoc store :visible? visible?))))
                    (dispatch store))]
         #?(:clj resp
