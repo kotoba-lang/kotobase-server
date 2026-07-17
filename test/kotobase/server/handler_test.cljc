@@ -521,3 +521,58 @@
 
 (deftest blob-unknown-op
   (is (= "MethodNotImplemented" (:error (h/handle-blob (mem-store) "frob" "K" nil "did:x")))))
+
+;; ── visibility redaction (ADR-2607174500 Phase 3b) ────────────────────────────
+
+#?(:cljs
+   (deftest visibility-policy-redacts-reads-and-capability-opens
+     (async done
+       (let [store (mem-store)
+             caps {:did "did:web:reader"
+                   :resources ["kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact"
+                       {:graph "vis-g"
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":dm.\\\"]\"} "
+                                     "{:db/id \"m1\" :dm.message/text \"secret\"} "
+                                     "{:db/id \"p1\" :public/note \"open\"}]")}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph "vis-g"} nil)))
+             (.then (fn [r]
+                      (let [attrs (set (map :a (:datoms r)))]
+                        (is (contains? attrs ":public/note"))
+                        (is (not (contains? attrs ":dm.message/text"))
+                            "datoms redacts for anonymous"))
+                      (h/handle store "pull" {:graph "vis-g" :entity "m1"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:attrs r)) "pull (flat) redacts the protected entity")
+                      (h/handle store "entity" {:graph "vis-g" :entity "m1"} nil)))
+             (.then (fn [r]
+                      (is (= "{}" (:entity_edn r)) "entity map redacted for anonymous")
+                      (h/handle store "q" {:graph "vis-g" :query_edn "[nil \":dm.message/text\" nil]"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:rows r)) "q redacts protected rows")
+                      (h/handle store "datoms" {:graph "vis-g"} caps)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "datom:read-protected opens datoms")
+                      (h/handle store "entity" {:graph "vis-g" :entity "m1"} caps)))
+             (.then (fn [r]
+                      (is (re-find #"secret" (str (:entity_edn r)))
+                          "capability opens entity pull")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest visibility-policy-less-graph-is-public
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact"
+                       {:graph "vis-g" :tx_edn "[{:db/id \"m1\" :dm.message/text \"hi\"}]"}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph "vis-g"} nil)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "no policy → fully public (zero regression)")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
