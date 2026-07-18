@@ -13,7 +13,7 @@
  ;; signer's pubkey for every IPNS record signature check.
  :deps {io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "f9afddee38c1513032e31f4de2a0920527b55a3e"}
+         :git/sha "ab58659f96ef598f347483f008b193b296327d0f"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
          :git/sha "a1799ffaa20557ba9b3eb956d4978c865734aa49"}}
