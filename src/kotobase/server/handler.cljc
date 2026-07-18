@@ -36,9 +36,11 @@
             [clojure.string :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
-            [multiformats.core :as mf]))
+            [multiformats.core :as mf]
+            [ipld.core :as ipld]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
+(def kg-ns "ai.gftd.apps.kotobase.kg")
 
 (defn- then*
   "Thread `x` through `f` across the engine's platform split (ADR-2607051000:
@@ -246,6 +248,161 @@
                       {:ok true :graph graph :commit chain :previous_commit prev-chain
                        :datom_count (count quads)
                        :novelty_size (eng/novelty-size get-fn chain)}))))))
+
+;; ── kg.ingest / kg.ingest_batch (ai.gftd.apps.kotobase.kg.*, additive) ───────
+;; A SEPARATE NSID family from datomic.* above -- extracted here (2026-07-18)
+;; alongside the datomic.* extraction so `net-kotobase`'s kotobase-cf-wasm
+;; deployment (the actual live production backend this library serves,
+;; behind kotobase.net's KOTOBA_BACKEND_URL) can share ONE kg.ingest
+;; implementation, same reasoning as this whole namespace's own extraction
+;; (see the ns docstring). Ported byte-for-byte from
+;; `kotoba-lang/kotobase-cljc-worker`'s own handler.cljc kg.* addition --
+;; see that file's equivalent section comment for the full field-shape /
+;; predicate-namespacing reasoning (cloud-itonami's real live camelCase
+;; pred/value/dstId wire shape vs. the lexicon's documented snake_case
+;; predicate/object/target shape; kg/claim/<pred>, kg/relation/<pred>,
+;; kg/entity/<field>, kg/label_vec predicate namespacing).
+;;
+;; Projects a kg "entity + claims + relations" payload into the SAME
+;; {:s :p :o} quad model tx-edn->quads already produces, then reuses do-
+;; transact's own authorization + commit machinery (kg-commit!, factored
+;; out below) verbatim -- a kg write is exactly as write-gated as a datom
+;; write, no separate/weaker policy path.
+
+(defn- kg-field
+  "`entity`'s value for one logical field, trying the camelCase key first
+  (the real live caller's wire shape), then the lexicon's snake_case key."
+  [entity camel-k snake-k]
+  (if (contains? entity camel-k) (get entity camel-k) (get entity snake-k)))
+
+(def ^:private kg-entity-scalar-fields
+  "[camel-key snake-key canonical-name] -- every ai.gftd.apps.kotobase.kg.ingest
+  entity-level scalar field besides :id/:claims/:relations/:label_vec
+  (handled separately below), projected as `kg/entity/<canonical-name>`
+  quads when present under either spelling."
+  [[:type nil "type"]
+   [:qid nil "qid"]
+   [:labelJa :label_ja "labelJa"]
+   [:labelEn :label_en "labelEn"]
+   [:confidence nil "confidence"]
+   [:license nil "license"]
+   [:extractor nil "extractor"]
+   [:sourceId :source_id "sourceId"]
+   [:validFrom :valid_from "validFrom"]
+   [:validTo :valid_to "validTo"]
+   [:ingestedAt :ingested_at "ingestedAt"]])
+
+(defn- kg-entity-scalar-quads [entity-id entity]
+  (for [[camel-k snake-k canonical] kg-entity-scalar-fields
+        :let [v (kg-field entity camel-k snake-k)]
+        :when (some? v)]
+    {:s entity-id :p (str "kg/entity/" canonical) :o (str v)}))
+
+(defn- kg-label-vec-quads [entity-id entity]
+  (let [v (kg-field entity :labelVec :label_vec)]
+    (when (some? v)
+      [{:s entity-id :p "kg/label_vec" :o (pr-str v)}])))
+
+(defn- kg-claim-quads [entity-id claims]
+  (for [c claims
+        :let [pred (kg-field c :pred :predicate)
+              value (kg-field c :value :object)]
+        :when (and (some? pred) (some? value))]
+    {:s entity-id :p (str "kg/claim/" pred) :o (str value)}))
+
+(defn- kg-relation-quads [entity-id relations]
+  (for [r relations
+        :let [pred (kg-field r :pred :predicate)
+              target (kg-field r :dstId :target)]
+        :when (and (some? pred) (some? target))]
+    {:s entity-id :p (str "kg/relation/" pred) :o (str target)}))
+
+(defn kg-entity->quads
+  "One ai.gftd.apps.kotobase.kg.ingest entity map -> its `{:s :p :o}` quads
+  (entity-level scalars + claims + relations -- see the section comment
+  above for the exact predicate shapes and dual camelCase/snake_case field
+  acceptance). Throws on a missing/blank :id -- every quad needs a
+  subject."
+  [entity]
+  (let [entity-id (some-> (:id entity) str)]
+    (when (str/blank? entity-id)
+      (throw (ex-info "kotobase kg: entity :id is required" {:entity entity})))
+    (vec (concat (kg-entity-scalar-quads entity-id entity)
+                 (kg-label-vec-quads entity-id entity)
+                 (kg-claim-quads entity-id (:claims entity))
+                 (kg-relation-quads entity-id (:relations entity))))))
+
+(defn kg-subject-cid
+  "Content-addressed CID of one kg.ingest entity payload -- CIDv1/dag-cbor/
+  sha2-256 over `(pr-str entity)` via `ipld/node->block`, the SAME
+  primitive `kotobase-peer.policy/policy-cid` already uses for the same
+  'stable content identity of an EDN blob' need. A real hash, not a
+  fabricated-looking placeholder string."
+  [entity]
+  (:cid (ipld/node->block {"type" "kotobase/kg-entity/v1" "entity" (pr-str entity)})))
+
+(defn- kg-commit!
+  "Shared write path for do-kg-ingest/do-kg-ingest-batch: the SAME
+  authorization + commit machinery do-transact uses above (read the
+  graph's in-chain policy, policy/assert-write-authorized! against it,
+  then eng/commit! + head-put!) -- factored out so neither kg entry point
+  copy-pastes (and risks silently drifting from) that gate. `quads` is the
+  full flattened set for the whole request (one entity or a batch); `auth`
+  is do-transact's own `auth` contract unchanged (a verified-CACAO
+  {:did :effective-caps ...} context map, or -- embedded/test
+  compatibility only -- a bare did)."
+  [store graph quads auth]
+  (let [get-fn (:get-fn store)
+        prev-chain ((:head-get store) graph)
+        context (if (map? auth)
+                  auth
+                  {:did auth :effective-caps #{policy/transact-capability
+                                               policy/policy-admin-capability}})
+        policy-rows (if prev-chain
+                      (eng/hot-datoms get-fn prev-chain
+                                      {:index :eavt :components [policy/policy-entity]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store))
+                      #?(:clj [] :cljs (js/Promise.resolve [])))]
+    (then* policy-rows
+           (fn [rows]
+             (policy/assert-write-authorized!
+              (policy/policy-of rows) context quads (:security-mode store))
+             (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
+                    (fn [chain]
+                      ((:head-put! store) graph chain)
+                      {:chain chain :previous-chain prev-chain}))))))
+
+(defn do-kg-ingest
+  "`kg.ingest` -- ingest ONE entity (see the section comment above for the
+  quad projection). body: {:graph <derived by the caller shell from the
+  verified CACAO's own kotoba://graph/<db-name> resource -- kg.ingest's
+  own wire body carries no :graph/:db_name field at all> ...entity
+  fields}. Response mirrors the lexicon: {:ok :subjectCid :quadCount}."
+  [store body auth]
+  (let [entity (dissoc body :graph :tenant_did :cacao_b64)
+        quads (kg-entity->quads entity)
+        subject-cid (kg-subject-cid entity)]
+    (then* (kg-commit! store (:graph body) quads auth)
+           (fn [{:keys [chain previous-chain]}]
+             {:ok true :graph (:graph body) :subjectCid subject-cid
+              :quadCount (count quads) :commit chain :previous_commit previous-chain}))))
+
+(defn do-kg-ingest-batch
+  "`kg.ingest_batch` -- ingest MANY entities as one commit (one novelty
+  block covering every entity's quads, not one commit per entity -- same
+  O(|tx|) reasoning as do-transact). body: {:graph <derived, see
+  do-kg-ingest> :entities [<kg.ingest-shaped entity> ...]}. Response
+  mirrors the lexicon: {:ok :ingested :subjectCids :quadCount}."
+  [store {:keys [graph entities]} auth]
+  (let [entities (vec entities)
+        per-entity (mapv (fn [e] {:quads (kg-entity->quads e) :subject-cid (kg-subject-cid e)})
+                         entities)
+        quads (vec (mapcat :quads per-entity))]
+    (then* (kg-commit! store graph quads auth)
+           (fn [{:keys [chain previous-chain]}]
+             {:ok true :graph graph :ingested (count entities)
+              :subjectCids (mapv :subject-cid per-entity)
+              :quadCount (count quads) :commit chain :previous_commit previous-chain}))))
 
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) -- for `do-q`/
@@ -851,6 +1008,8 @@
                 "txRange"     (do-tx-range store body)
                 "log"         (do-log store body)
                 "sync"        (do-sync store body)
+                "kg.ingest"       (do-kg-ingest store body auth)
+                "kg.ingest_batch" (do-kg-ingest-batch store body auth)
                 {:ok false :error "MethodNotImplemented" :method method})))]
     (try
       ;; ADR-2607174500 Phase 3b: resolve (graph policy × viewer caps) into
