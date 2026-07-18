@@ -522,6 +522,28 @@
 (deftest blob-unknown-op
   (is (= "MethodNotImplemented" (:error (h/handle-blob (mem-store) "frob" "K" nil "did:x")))))
 
+(deftest private-blob-surface-requires-resource-capability-and-content-digest
+  (let [store (assoc (mem-store) :security-mode :private)
+        key (str "SHA256E-s3--"
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        bytes #?(:clj (byte-array (map byte [97 98 99]))
+                 :cljs (js/Uint8Array.from #js [97 98 99]))
+        resource (str "kotoba://blob/" key)
+        writer {:did "did:owner" :effective-caps #{resource "kotoba://can/blob:put"}}
+        reader {:did "did:reader" :effective-caps #{resource "kotoba://can/blob:read"}}
+        remover {:did "did:owner" :effective-caps #{resource "kotoba://can/blob:remove"}}]
+    (is (= "AccessDenied" (:error (h/handle-blob store "put" key bytes "did:owner"))))
+    (is (= "ContentDigestMismatch"
+           (:error (h/handle-blob store "put" key
+                                  #?(:clj (byte-array (map byte [120 121 122]))
+                                     :cljs (js/Uint8Array.from #js [120 121 122]))
+                                  writer))))
+    (is (:ok (h/handle-blob store "put" key bytes writer)))
+    (is (= "AccessDenied" (:error (h/handle-blob store "get" key nil nil))))
+    (is (:ok (h/handle-blob store "get" key nil reader)))
+    (is (= "AccessDenied" (:error (h/handle-blob store "remove" key nil writer))))
+    (is (:ok (h/handle-blob store "remove" key nil remover)))))
+
 ;; ── visibility redaction (ADR-2607174500 Phase 3b) ────────────────────────────
 
 #?(:cljs
@@ -578,6 +600,37 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   (deftest private-metadata-surface-requires-read-capability
+     (async done
+       (let [store (assoc (mem-store) :security-mode :private)
+             reader {:did "did:web:reader"
+                     :resources ["kotoba://can/datom:read"]}]
+         (-> (h/handle store "transact"
+                       {:graph "private-g"
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":secret.\\\"]\" "
+                                     ":kotobase.policy/write-prefixes \"[\\\":app.\\\"]\" "
+                                     ":kotobase.policy/security-mode :private}]")}
+                       "did:web:admin")
+             (.then (fn [tx]
+                      (is (:ok tx))
+                      (h/handle store "transact"
+                                {:graph "private-g"
+                                 :tx_edn "[{:db/id \"e\" :app.value \"x\"}]"}
+                                "did:web:admin")))
+             (.then (fn [tx]
+                      (is (:ok tx))
+                      (h/handle store "dbStats" {:graph "private-g"} nil)))
+             (.then (fn [denied]
+                      (is (= "AccessDenied" (:error denied)))
+                      (h/handle store "dbStats" {:graph "private-g"} reader)))
+             (.then (fn [allowed]
+                      (is (:ok allowed))
+                      (is (= 2 (:novelty_size allowed)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest owner-based-disclosure-server
      (async done
        (let [store (mem-store)
@@ -599,5 +652,57 @@
              (.then (fn [r]
                       (is (empty? (filter #(= ":dm.message/text" (:a %)) (:datoms r)))
                           "anonymous sees no protected rows")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest protected-rows-cannot-influence-joins-aggregates-pull-or-history
+     (async done
+       (let [store (assoc (mem-store) :security-mode :private)
+             reader {:did "did:reader" :resources ["kotoba://can/datom:read"]}
+             protected-reader {:did "did:auditor"
+                               :resources ["kotoba://can/datom:read"
+                                           "kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact"
+                       {:graph "infer-g"
+                        :tx_edn (pr-str [{:db/id "kotobase.policy/read"
+                                         :kotobase.policy/protected-prefixes
+                                         (pr-str [":secret."])
+                                         :kotobase.policy/write-prefixes
+                                         (pr-str [":public." ":secret."])
+                                         :kotobase.policy/security-mode :private}])}
+                       "did:admin")
+             (.then (fn [_]
+                      (h/handle store "transact"
+                                {:graph "infer-g"
+                                 :tx_edn "[{:db/id \"e1\" :public.name \"Alice\" :secret.flag \"yes\"}]"}
+                                "did:admin")))
+             (.then (fn [_]
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [?name] :where [[?e \":secret.flag\" \"yes\"] [?e \":public.name\" ?name]]}"}
+                                reader)))
+             (.then (fn [joined]
+                      (is (empty? (:rows joined)) "hidden clause cannot select a public projection")
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [(count ?e)] :where [[?e \":secret.flag\" _]]}"}
+                                reader)))
+             (.then (fn [aggregate]
+                      (is (= [[0]] (:rows aggregate)) "aggregate observes zero authorized rows")
+                      (h/handle store "pullMany"
+                                {:graph "infer-g" :entities ["e1"] :pattern_edn "[*]"}
+                                reader)))
+             (.then (fn [pulled]
+                      (is (not (re-find #"secret" (str (:results_edn pulled)))))
+                      (h/handle store "history" {:graph "infer-g" :entity "e1"} reader)))
+             (.then (fn [history]
+                      (is (empty? (filter #(= ":secret.flag" (:a %)) (:datoms history))))
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [(count ?e)] :where [[?e \":secret.flag\" _]]}"}
+                                protected-reader)))
+             (.then (fn [allowed]
+                      (is (= [[1]] (:rows allowed)))
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))

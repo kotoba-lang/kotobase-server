@@ -39,23 +39,25 @@ kotobase.server.trampoline    -- with-blocks: bridges any async block store
 kotobase.server.ipns          -- pure decision logic for
                                  com.etzhayyim.apps.kotoba.ipns.{head,publish}
                                  (signature-gated writes, no CACAO)
+kotobase.server.runtime       -- platform-neutral block/head/claim/authority/
+                                 KMS/audit ports and fail-closed service
+                                 validation for secured network runtimes
 ```
 
-Storage (R2/B2/IndexedDB adapters), CAS-with-retry orchestration, CACAO
-verification, and the actual HTTP/`Response` shell are all the CONSUMER's
-job — see `kotoba-lang/kotobase-cljc-worker`'s `worker.cljc` (R2/Cloudflare)
-or `kotoba-lang/kotobase-browser-worker`'s equivalent (IndexedDB) for
-reference shells.
+Storage adapters (R2/B2/IndexedDB), the actual HTTP/`Response` shell, routes,
+and product policy are the consumer's job. CACAO/delegation verification,
+normalized `SecurityContext`, keyring envelopes, audit receipts, replay and
+idempotency orchestration are common security semantics and are being
+consolidated here; deployable consumers must not fork them. The sole public
+Cloudflare product owner is `gftdcojp/net-kotobase`.
 
 ## Crypto is injected, not policy
 
 `kotobase-peer`'s `blind-fn`/`encrypt-fn`/`decrypt-fn` seam (ADR-2607051000,
 no silent default) is threaded through `store` like the storage fns are —
-this repo doesn't ship a default profile. A consumer picks a
-plaintext-passthrough profile (the pre-encryption interim posture several
-current deployments use) or a real AEAD profile (HKDF-derived AES-256-GCM +
-HMAC blind, for example) by supplying those three functions; nothing here
-needs to change either way.
+the engine remains adapter-neutral. Private/sealed network runtimes use the
+common versioned AES-256-GCM-SIV/keyring profile; plaintext passthrough is only
+for explicit local/legacy-public use.
 
 ## Testing
 

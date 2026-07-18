@@ -35,7 +35,8 @@
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
             [kotobase-peer.core :as eng]
-            [kotobase-peer.policy :as policy]))
+            [kotobase-peer.policy :as policy]
+            [multiformats.core :as mf]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -176,15 +177,18 @@
         viewer-did (:did viewer)]
     (fn [graph]
       (let [chain ((:head-get store) graph)]
-        (if (nil? chain)
-          #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+    (if (nil? chain)
+      (let [visible? (policy/visible-for-mode nil caps #{} (:security-mode store))]
+        #?(:clj visible? :cljs (js/Promise.resolve visible?)))
           (then* (eng/hot-datoms (:get-fn store) chain
                                  {:index :eavt :components [policy/policy-entity]}
                                  (constantly true) (:blind-fn store) (:decrypt-fn store))
                  (fn [rows]
                    (let [policy (policy/policy-of rows)]
                      (then* (owned-entities store chain policy viewer-did)
-                            (fn [owned] (policy/visible-for policy caps owned)))))))))))
+                            (fn [owned]
+                              (policy/visible-for-mode policy caps owned
+                                                       (:security-mode store))))))))))))
 
 (defn do-datoms
   "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
@@ -219,16 +223,29 @@
   AFTER this fn returns, retrying the WHOLE call on a lost race). See
   `kotoba-lang/kotobase-cljc-worker`'s `worker.cljc` (`run-write-attempt`/
   `run-write`) for the reference orchestration this was extracted from."
-  [store {:keys [graph tx_edn]} _auth-did]
+  [store {:keys [graph tx_edn]} auth]
   (let [get-fn (:get-fn store)
         prev-chain ((:head-get store) graph)
-        quads (tx-edn->quads tx_edn)]
-    (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
-           (fn [chain]
-             ((:head-put! store) graph chain)
-             {:ok true :graph graph :commit chain
-              :datom_count (count quads)
-              :novelty_size (eng/novelty-size get-fn chain)}))))
+        quads (vec (tx-edn->quads tx_edn))
+        context (if (map? auth)
+                  auth
+                  {:did auth :effective-caps #{policy/transact-capability
+                                               policy/policy-admin-capability}})
+        policy-rows (if prev-chain
+                      (eng/hot-datoms get-fn prev-chain
+                                      {:index :eavt :components [policy/policy-entity]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store))
+                      #?(:clj [] :cljs (js/Promise.resolve [])))]
+    (then* policy-rows
+           (fn [rows]
+             (policy/assert-write-authorized!
+              (policy/policy-of rows) context quads (:security-mode store))
+             (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
+                    (fn [chain]
+                      ((:head-put! store) graph chain)
+                      {:ok true :graph graph :commit chain :previous_commit prev-chain
+                       :datom_count (count quads)
+                       :novelty_size (eng/novelty-size get-fn chain)}))))))
 
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) -- for `do-q`/
@@ -690,7 +707,8 @@
                         (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store))
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
-               {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n})))))
+               {:ok true :graph graph :folded true :commit new-chain
+                :previous_commit chain :novelty_folded novelty-n})))))
 
 ;; ── blob surface ─────────────────────────────────────────────────────────────
 ;; git-annex / DataLad の content-addressed 大容量バイナリ永続化面（ADR-2607175000）。
@@ -735,16 +753,54 @@
   ((:head-put! store) (blob-tomb key) "removed")
   {:ok true :key key})
 
+(defn- blob-resource [key] (str "kotoba://blob/" key))
+
+(defn- blob-authorized?
+  [store auth action key]
+  (if (not (contains? #{:private :sealed} (:security-mode store)))
+    ;; Explicit local/legacy compatibility only; network private/sealed never
+    ;; reaches this branch.
+    (if (contains? #{:put :remove} action) (some? auth) true)
+    (let [caps (set (or (:effective-caps auth) (:resources auth)))]
+      (and (map? auth)
+           (contains? caps (str "kotoba://can/blob:" (name action)))
+           (contains? caps (blob-resource key))))))
+
+(defn- bytes-count [bytes]
+  #?(:clj (alength ^bytes bytes) :cljs (.-length bytes)))
+
+(defn- bytes-hex [bytes]
+  (apply str (map (fn [n]
+                    #?(:clj (format "%02x" (bit-and (int n) 0xff))
+                       :cljs (.padStart (.toString (bit-and n 0xff) 16) 2 "0")))
+                  (mf/sha256 bytes))))
+
+(defn- valid-annex-content?
+  [key bytes]
+  (when-let [[_ size digest]
+             (re-matches #"SHA256E-s([0-9]+)--([0-9a-fA-F]{64})(?:\..*)?" key)]
+    (and (= (bytes-count bytes) #?(:clj (Long/parseLong size)
+                                   :cljs (js/parseInt size 10)))
+         (= (str/lower-case digest) (bytes-hex bytes)))))
+
 (defn handle-blob
   "blob 面の dispatch。`op` は put|get|head|remove、`bytes` は put 時のみ。
    auth-did は CACAO 検証済み issuer（put/remove は nil だと Unauthorized）。"
   [store op key bytes auth-did]
-  (letfn [(need-auth [] (when-not auth-did {:ok false :error "Unauthorized" :key key}))]
+  (letfn [(denied [action]
+            (when-not (blob-authorized? store auth-did action key)
+              {:ok false :error (if (contains? #{:private :sealed} (:security-mode store))
+                                  "AccessDenied" "Unauthorized")
+               :key key}))]
     (case op
-      "put"    (or (need-auth) (do-blob-put store key bytes auth-did))
-      "get"    (do-blob-get store key)
-      "head"   (do-blob-head store key)
-      "remove" (or (need-auth) (do-blob-remove store key auth-did))
+      "put"    (or (denied :put)
+                   (when (and (contains? #{:private :sealed} (:security-mode store))
+                              (not (valid-annex-content? key bytes)))
+                     {:ok false :error "ContentDigestMismatch" :key key})
+                   (do-blob-put store key bytes auth-did))
+      "get"    (or (denied :read) (do-blob-get store key))
+      "head"   (or (denied :read) (do-blob-head store key))
+      "remove" (or (denied :remove) (do-blob-remove store key auth-did))
       {:ok false :error "MethodNotImplemented" :op op})))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
@@ -762,16 +818,20 @@
   InternalError instead."
   [store method body auth]
   (letfn [(err [e]
-            (if (:block-miss (ex-data e))
-              (throw e)
-              {:ok false :error "InternalError"
-               :message #?(:clj (.getMessage ^Exception e)
-                           :cljs (or (ex-message e) (.-message e)))}))
+            (let [data (ex-data e)]
+              (cond
+                (:block-miss data) (throw e)
+                (= :kotobase.policy/write-denied (:type data))
+                {:ok false :error "AccessDenied"
+                 :reason (some-> data :decision :denials first :reason name)}
+                :else {:ok false :error "InternalError"
+                       :message #?(:clj (.getMessage ^Exception e)
+                                   :cljs (or (ex-message e) (.-message e)))})))
           (dispatch [store]
             (let [auth-did (if (map? auth) (:did auth) auth)]
               (case method
                 "datoms"      (do-datoms store body)
-                "transact"    (do-transact store body auth-did)
+                "transact"    (do-transact store body auth)
                 "q"           (do-q store body)
                 "pull"        (do-pull store body)
                 "pullMany"    (do-pull-many store body)
@@ -800,12 +860,22 @@
       ;; commit metadata and id mappings, no datom content) skip the extra
       ;; narrow read entirely.
       (let [viewer (when (map? auth) auth)
-            visibility-methods #{"datoms" "q" "pull" "pullMany" "indexPull"
-                                 "entity" "asOf" "since" "history"
-                                 "seekDatoms" "indexRange"}
-            resp (if (and (contains? visibility-methods method) (:graph body))
+            row-methods #{"datoms" "q" "pull" "pullMany" "indexPull"
+                          "entity" "asOf" "since" "history"
+                          "seekDatoms" "indexRange"}
+            metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"
+                               "txRange" "log" "sync"}
+            policy-methods (into row-methods metadata-methods)
+            resp (if (and (contains? policy-methods method) (:graph body))
                    (then* ((request-visible? store viewer) (:graph body))
-                          (fn [visible?] (dispatch (assoc store :visible? visible?))))
+                          (fn [visible?]
+                            (let [evidence (policy/visibility-evidence visible?)
+                                  result (if (or (contains? row-methods method)
+                                                 (visible? {:e "kotobase.metadata/request"
+                                                            :a ":kotobase.metadata/read"}))
+                                           (dispatch (assoc store :visible? visible?))
+                                           {:ok false :error "AccessDenied"})]
+                              (then* result #(merge % evidence)))))
                    (dispatch store))]
         #?(:clj resp
            :cljs (.catch (js/Promise.resolve resp) err)))
