@@ -38,6 +38,7 @@
             [kotobase-peer.policy :as policy]
             [kotobase.server.sparql :as sparql]
             [kotobase.server.cypher :as cypher]
+            [kotobase.server.query-exec :as qx]
             [multiformats.core :as mf]
             [ipld.core :as ipld]))
 
@@ -573,6 +574,21 @@
                           (eng/q db pat (visible-of store)))]
                {:ok true :graph graph :rows (vec rows)})))))
 
+(defn- run-compiled-graph-query
+  "Shared executor for the SPARQL/Cypher compiled-query shape: base BGP to
+  the engine, then OPTIONAL (left join) / FILTER / aggregation in
+  `kotobase.server.query-exec` -- see its docstring for the correctness/
+  performance trade (post-pass over the base result set, not pushed into
+  the engine executor)."
+  [store graph parsed]
+  (let [chain ((:head-get store) graph)]
+    (then* (hot-db store chain)
+           (fn [db]
+             (let [{:keys [vars rows]} (qx/execute
+                                        (fn [q] (eng/query db q (visible-of store)))
+                                        parsed)]
+               {:ok true :graph graph :vars vars :rows rows})))))
+
 (defn do-sparql
   "`graph.sparql` -- SPARQL BASIC SUBSET over the same hot db `do-q` uses.
   body: {:graph :sparql}. `kotobase.server.sparql/parse` compiles
@@ -591,14 +607,7 @@
                         (throw e))))]
     (if-some [msg (::unsupported parsed)]
       {:ok false :error "UnsupportedSparql" :message msg}
-      (let [chain ((:head-get store) graph)]
-        (then* (hot-db store chain)
-               (fn [db]
-                 (let [rows (eng/query db (dissoc parsed :limit) (visible-of store))
-                       rows (if-let [n (:limit parsed)] (take n rows) rows)]
-                   {:ok true :graph graph
-                    :vars (mapv str (:find parsed))
-                    :rows (vec rows)})))))))
+      (run-compiled-graph-query store graph parsed))))
 
 (defn do-cypher
   "`graph.query` -- CYPHER BASIC SUBSET over the same hot db `do-q` uses.
@@ -616,14 +625,7 @@
                         (throw e))))]
     (if-some [msg (::unsupported parsed)]
       {:ok false :error "UnsupportedCypher" :message msg}
-      (let [chain ((:head-get store) graph)]
-        (then* (hot-db store chain)
-               (fn [db]
-                 (let [rows (eng/query db (dissoc parsed :limit) (visible-of store))
-                       rows (if-let [n (:limit parsed)] (take n rows) rows)]
-                   {:ok true :graph graph
-                    :vars (mapv str (:find parsed))
-                    :rows (vec rows)})))))))
+      (run-compiled-graph-query store graph parsed))))
 
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +

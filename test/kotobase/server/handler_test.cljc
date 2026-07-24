@@ -1014,3 +1014,90 @@
                       (is (= "UnsupportedCypher" (:error r)))
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-depth-optional-filter-aggregates
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gd" :tx_edn "[{:db/id \"p1\" :d/name \"alice\" :d/age 30 :d/city \"tokyo\"} {:db/id \"p2\" :d/name \"bob\" :d/age 20 :d/city \"tokyo\"} {:db/id \"p3\" :d/name \"carol\" :d/city \"osaka\"}]"}
+                            "did:key:ztest"))
+        sq (fn [q] (h/handle store "sparql" {:graph "gd" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sq "SELECT ?n ?a WHERE { ?e <:d/name> ?n . OPTIONAL { ?e <:d/age> ?a } }")]
+             (is (:ok r))
+             (is (= #{["alice" "30"] ["bob" "20"] ["carol" nil]} (set (:rows r)))
+                 "OPTIONAL left-joins; unmatched rows nil-fill")))
+         (fn []
+           (let [r (sq "SELECT ?n WHERE { ?e <:d/name> ?n . ?e <:d/age> ?a . FILTER(?a > 25) }")]
+             (is (:ok r))
+             (is (= [["alice"]] (:rows r)) "numeric FILTER on stringified numbers")))
+         (fn []
+           (let [r (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city } GROUP BY ?city")]
+             (is (:ok r))
+             (is (= #{[2 "tokyo"] [1 "osaka"]} (set (:rows r))))
+             (is (= ["?c" "?city"] (:vars r)))))
+         (fn []
+           (let [r (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city }")]
+             (is (false? (:ok r)) "bare var with aggregate but no GROUP BY rejected")))
+         (fn []
+           (let [r (sq "SELECT (SUM(?a) AS ?s) WHERE { ?e <:d/age> ?a }")]
+             (is (:ok r))
+             (is (= [[50.0]] (:rows r)) "SUM over numeric strings")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (sq "SELECT ?n ?a WHERE { ?e <:d/name> ?n . OPTIONAL { ?e <:d/age> ?a } }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= #{["alice" "30"] ["bob" "20"] ["carol" nil]} (set (:rows r))))
+                      (sq "SELECT ?n WHERE { ?e <:d/name> ?n . ?e <:d/age> ?a . FILTER(?a > 25) }")))
+             (.then (fn [r]
+                      (is (= [["alice"]] (:rows r)))
+                      (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city } GROUP BY ?city")))
+             (.then (fn [r]
+                      (is (= #{[2 "tokyo"] [1 "osaka"]} (set (:rows r))))
+                      (sq "SELECT (SUM(?a) AS ?s) WHERE { ?e <:d/age> ?a }")))
+             (.then (fn [r]
+                      (is (= [[50]] (:rows r)) "SUM over numeric strings (js number)")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-depth-comparisons-and-count
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "ge" :tx_edn "[{:db/id \"p1\" :d/name \"alice\" :d/age 30} {:db/id \"p2\" :d/name \"bob\" :d/age 20}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "ge" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (p {d/name: \"alice\"}) WHERE p.d/age >= 25 RETURN p")]
+             (is (:ok r))
+             (is (= [["p1"]] (:rows r)) "comparison operator routes through the filter post-pass")))
+         (fn []
+           (let [r (cy "MATCH (p)-[:d/name]->(n) RETURN count(p)")]
+             (is (:ok r))
+             (is (= [[2]] (:rows r)))
+             (is (= ["?count_p"] (:vars r)) "default aggregate alias")))
+         (fn []
+           (let [r (cy "MATCH (p)-[:d/name]->(n) WHERE p.d/age < 25 RETURN count(p) AS c")]
+             (is (:ok r))
+             (is (= [[1]] (:rows r)))
+             (is (= ["?c"] (:vars r)))))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy "MATCH (p {d/name: \"alice\"}) WHERE p.d/age >= 25 RETURN p")))
+             (.then (fn [r]
+                      (is (= [["p1"]] (:rows r)))
+                      (cy "MATCH (p)-[:d/name]->(n) RETURN count(p)")))
+             (.then (fn [r]
+                      (is (= [[2]] (:rows r)))
+                      (cy "MATCH (p)-[:d/name]->(n) WHERE p.d/age < 25 RETURN count(p) AS c")))
+             (.then (fn [r]
+                      (is (= [[1]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
