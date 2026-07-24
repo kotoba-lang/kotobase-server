@@ -4,10 +4,16 @@
 
     {:find      [?v ... | {:agg :count :var ?x :as ?c} ...]
      :where     [[s p o] ...]          ;; base BGP -> engine query
+     :unions    [[[s p o] ...] ...]    ;; alternative BGPs -> solution union
      :optionals [[[s p o] ...] ...]    ;; OPTIONAL blocks -> LEFT JOIN
      :filters   [{:var ?v :op :< :value \"10\"} ...]
      :group-by  [?v ...]
+     :order-by  [{:var ?v :dir :asc|:desc} ...]
      :limit     n}
+
+  Either :where or :unions supplies the base solutions -- :unions is the
+  bag union (SPARQL default semantics: duplicates kept) of each branch's
+  solutions, with variables absent from a branch nil-filled.
 
   OPTIONAL, FILTER and aggregation run HERE, above the engine, as a
   correct-by-construction post-pass: OPTIONAL is a left outer join of a
@@ -79,11 +85,19 @@
 
 (defn execute
   "engine-query: (fn [{:find [...] :where [...]}]) -> seq of tuples.
-  Returns {:vars [...] :rows [[...]...]} after OPTIONAL/FILTER/aggregation."
-  [engine-query {:keys [find where optionals filters group-by limit]}]
-  (let [base-vars (pattern-vars where)
-        base-rows (engine-query {:find base-vars :where where})
-        bind-maps (rows->maps base-vars base-rows)
+  Returns {:vars [...] :rows [[...]...]} after UNION/OPTIONAL/FILTER/
+  aggregation/ORDER BY."
+  [engine-query {:keys [find where unions optionals filters group-by order-by limit]}]
+  (let [bind-maps
+        (if (seq unions)
+          (let [all-union-vars (vec (distinct (mapcat pattern-vars unions)))]
+            (vec (mapcat (fn [branch]
+                           (let [bvars (pattern-vars branch)
+                                 nil-fill (zipmap (remove (set bvars) all-union-vars) (repeat nil))]
+                             (map #(merge nil-fill %) (rows->maps bvars (engine-query {:find bvars :where branch})))))
+                         unions)))
+          (let [base-vars (pattern-vars where)]
+            (rows->maps base-vars (engine-query {:find base-vars :where where}))))
         bind-maps (reduce (fn [bms opt-patterns]
                             (let [opt-vars (pattern-vars opt-patterns)
                                   opt-rows (engine-query {:find opt-vars :where opt-patterns})]
@@ -105,6 +119,25 @@
                           find))
                   groups))
           :else (mapv (fn [bm] (mapv #(get bm %) find)) bind-maps))
+        find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
+        rows (if (seq order-by)
+               (let [idx-of (fn [v] (let [i (.indexOf find-keys v)]
+                                      (when (neg? i) (throw (ex-info "ORDER BY var not projected" {:var v})))
+                                      i))
+                     specs (mapv (fn [{:keys [var dir]}] [(idx-of var) (or dir :asc)]) order-by)
+                     keyfn (fn [row] (mapv (fn [[i _]] (comparable-value (nth row i))) specs))
+                     cmp (fn [ka kb]
+                           (loop [n 0]
+                             (if (= n (count specs))
+                               0
+                               (let [[_ dir] (nth specs n)
+                                     a (nth ka n) b (nth kb n)
+                                     c (cond (and (number? a) (number? b)) (compare a b)
+                                             :else (compare (str a) (str b)))
+                                     c (if (= dir :desc) (- c) c)]
+                                 (if (zero? c) (recur (inc n)) c)))))]
+                 (vec (sort-by keyfn cmp rows)))
+               rows)
         rows (if limit (vec (take limit rows)) (vec rows))]
-    {:vars (mapv (fn [item] (str (if (map? item) (:as item) item))) find)
+    {:vars (mapv str find-keys)
      :rows rows}))

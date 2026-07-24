@@ -30,7 +30,7 @@
   (:require [clojure.string :as str]))
 
 (def grammar-help
-  "supported: SELECT ?v ...|*|(COUNT(?x) AS ?c) WHERE { s p o . OPTIONAL { s p o } FILTER(?v op lit) } [GROUP BY ?v] [LIMIT n]; ops: = != < <= > >=; aggs: COUNT SUM MIN MAX AVG")
+  "supported: SELECT ?v ...|*|(COUNT(?x) AS ?c) WHERE { s p o . OPTIONAL { s p o } FILTER(?v op lit) } | { t } UNION { t } [GROUP BY ?v] [ORDER BY ?v|DESC(?v)] [LIMIT n]; ops: = != < <= > >=; aggs: COUNT SUM MIN MAX AVG")
 
 (defn- fail [msg near]
   (throw (ex-info (str "sparql-subset: " msg " (near: " (pr-str near) "). " grammar-help)
@@ -104,8 +104,23 @@
         (recur (vec more) where optionals
                (conj filters {:var (symbol v) :op (get ops op) :value (term->value lit)})))
       (= "." (first ts)) (recur (rest ts) where optionals filters)
+      (= "{" (first ts))
+      ;; braced group chain: { t... } UNION { t... } [UNION { t... }]* --
+      ;; stored via a sentinel in `where` meta below (returned separately).
+      (let [[ts branches]
+            (loop [ts ts branches []]
+              (if (= "{" (first ts))
+                (let [[ts patterns] (parse-triples (rest ts) #(= "}" %))]
+                  (when (empty? patterns) (fail "UNION branch needs at least one pattern" "{}"))
+                  (let [ts (vec (rest ts))]
+                    (if (and (seq ts) (= "UNION" (upper (first ts))))
+                      (recur (vec (rest ts)) (conj branches patterns))
+                      [ts (conj branches patterns)])))
+                (fail "UNION must be followed by a { } group" (first ts))))]
+        (when (< (count branches) 2) (fail "a braced group must be part of a UNION chain" "{ }"))
+        (recur ts (vary-meta where assoc ::unions branches) optionals filters))
       :else
-      (let [[ts patterns] (parse-triples ts #(or (= "}" %) (= "OPTIONAL" (upper %)) (= "FILTER" (upper %))))]
+      (let [[ts patterns] (parse-triples ts #(or (= "}" %) (= "OPTIONAL" (upper %)) (= "FILTER" (upper %)) (= "{" %)))]
         (recur ts (into where patterns) optionals filters)))))
 
 (defn- parse-select
@@ -140,7 +155,24 @@
           _ (when (and (empty? find-items) (not star?)) (fail "SELECT needs ?vars, * or aggregates" "WHERE"))
           _ (when-not (= "{" (first ts)) (fail "WHERE must open with {" (first ts)))
           [ts where optionals filters] (parse-where-body (vec (rest ts)))
-          _ (when (empty? where) (fail "WHERE needs at least one triple pattern outside OPTIONAL" "{}"))
+          unions (::unions (meta where))
+          _ (when (and (seq unions) (seq where))
+              (fail "mixing bare triples with a UNION chain in one WHERE is unsupported" "UNION"))
+          _ (when (and (empty? where) (empty? unions))
+              (fail "WHERE needs at least one triple pattern outside OPTIONAL" "{}"))
+          [ts order-by']
+          (if (and (seq ts) (= "ORDER" (upper (first ts))))
+            (do (when-not (= "BY" (upper (second ts))) (fail "ORDER must be followed by BY" (second ts)))
+                (loop [ts (vec (drop 2 ts)) acc []]
+                  (cond
+                    (and (seq ts) (variable? (first ts)))
+                    (recur (vec (rest ts)) (conj acc {:var (symbol (first ts)) :dir :asc}))
+                    (and (seq ts) (contains? #{"ASC" "DESC"} (upper (first ts)))
+                         (= "(" (second ts)) (variable? (nth ts 2 "")) (= ")" (nth ts 3 nil)))
+                    (recur (vec (drop 4 ts))
+                           (conj acc {:var (symbol (nth ts 2)) :dir (if (= "DESC" (upper (first ts))) :desc :asc)}))
+                    :else (if (empty? acc) (fail "ORDER BY needs ?var / ASC(?var) / DESC(?var)" (first ts)) [ts acc]))))
+            [ts []])
           [ts group-by']
           (if (and (seq ts) (= "GROUP" (upper (first ts))))
             (do (when-not (= "BY" (upper (second ts))) (fail "GROUP must be followed by BY" (second ts)))
@@ -149,14 +181,28 @@
                     (recur (vec (rest ts)) (conj acc (symbol (first ts))))
                     (if (empty? acc) (fail "GROUP BY needs at least one ?var" (first ts)) [ts acc]))))
             [ts []])
+          [ts order-by']
+          (if (and (empty? order-by') (seq ts) (= "ORDER" (upper (first ts))))
+            (do (when-not (= "BY" (upper (second ts))) (fail "ORDER must be followed by BY" (second ts)))
+                (loop [ts (vec (drop 2 ts)) acc []]
+                  (cond
+                    (and (seq ts) (variable? (first ts)))
+                    (recur (vec (rest ts)) (conj acc {:var (symbol (first ts)) :dir :asc}))
+                    (and (seq ts) (contains? #{"ASC" "DESC"} (upper (first ts)))
+                         (= "(" (second ts)) (variable? (nth ts 2 "")) (= ")" (nth ts 3 nil)))
+                    (recur (vec (drop 4 ts))
+                           (conj acc {:var (symbol (nth ts 2)) :dir (if (= "DESC" (upper (first ts))) :desc :asc)}))
+                    :else (if (empty? acc) (fail "ORDER BY needs ?var / ASC(?var) / DESC(?var)" (first ts)) [ts acc]))))
+            [ts order-by'])
           limit
           (cond
             (empty? ts) nil
             (and (= "LIMIT" (upper (first ts))) (= 2 (count ts)) (re-matches #"[0-9]+" (second ts)))
             #?(:clj (Long/parseLong (second ts))
                :cljs (js/parseInt (second ts) 10))
-            :else (fail "only GROUP BY / LIMIT allowed after }" (first ts)))
+            :else (fail "only GROUP BY / ORDER BY / LIMIT allowed after }" (first ts)))
           all-vars (vec (distinct (concat (filter symbol? (mapcat identity where))
+                                          (mapcat (fn [ps] (filter symbol? (mapcat identity ps))) (or unions []))
                                           (mapcat (fn [ps] (filter symbol? (mapcat identity ps))) optionals))))
           find-items (if star? (vec (concat all-vars find-items)) find-items)
           bare-vars (filterv symbol? find-items)
@@ -174,7 +220,13 @@
         (doseq [v bare-vars]
           (when-not (some #{v} group-by')
             (fail "with aggregates, every bare SELECT var must be in GROUP BY" (str v)))))
-      (cond-> {:find find-items :where where}
+      (doseq [{:keys [var]} order-by']
+        (when-not (or (some #{var} (filterv symbol? find-items))
+                      (some (fn [it] (and (map? it) (= var (:as it)))) find-items))
+          (fail "ORDER BY var must be projected in SELECT" (str var))))
+      (cond-> {:find find-items :where (vec where)}
+        (seq unions) (assoc :unions unions)
+        (seq order-by') (assoc :order-by order-by')
         (seq optionals) (assoc :optionals optionals)
         (seq filters) (assoc :filters filters)
         (seq group-by') (assoc :group-by group-by')

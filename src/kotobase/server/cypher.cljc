@@ -170,13 +170,30 @@
                   (recur (vec (drop 2 ts)) acc)
                   [(vec (rest ts)) acc]))
               :else (fail "RETURN needs variable names or agg(var) (property access unsupported)" (first ts))))
+          [ts order-by']
+          (if (and (seq ts) (kw? (first ts) "ORDER"))
+            (do (when-not (kw? (second ts) "BY") (fail "ORDER must be followed by BY" (second ts)))
+                (loop [ts (vec (drop 2 ts)) acc []]
+                  (if (and (seq ts) (ident? (first ts)) (not (kw? (first ts) "LIMIT")))
+                    (let [v (symbol (str "?" (first ts)))
+                          [dir ts] (if (and (> (count ts) 1) (kw? (second ts) "DESC"))
+                                     [:desc (vec (drop 2 ts))]
+                                     (if (and (> (count ts) 1) (kw? (second ts) "ASC"))
+                                       [:asc (vec (drop 2 ts))]
+                                       [:asc (vec (rest ts))]))
+                          acc (conj acc {:var v :dir dir})]
+                      (if (= "," (first ts))
+                        (recur (vec (rest ts)) acc)
+                        [ts acc]))
+                    (if (empty? acc) (fail "ORDER BY needs variable names" (first ts)) [ts acc]))))
+            [ts []])
           limit
           (cond
             (empty? ts) nil
             (and (kw? (first ts) "LIMIT") (= 2 (count ts)) (re-matches #"[0-9]+" (second ts)))
             #?(:clj (Long/parseLong (second ts))
                :cljs (js/parseInt (second ts) 10))
-            :else (fail "only LIMIT n allowed after RETURN" (first ts)))
+            :else (fail "only ORDER BY / LIMIT allowed after RETURN" (first ts)))
           bound (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
           bare-vars (filterv symbol? find-vars)
           agg-items (filterv map? find-vars)
@@ -188,7 +205,12 @@
         (when-not (bound v) (fail "RETURN variable not bound in MATCH/WHERE" (str v))))
       (doseq [{:keys [var]} agg-items]
         (when-not (bound var) (fail "aggregate variable not bound in MATCH/WHERE" (str var))))
+      (doseq [{:keys [var]} order-by']
+        (when-not (or (some #{var} bare-vars)
+                      (some (fn [it] (and (map? it) (= var (:as it)))) agg-items))
+          (fail "ORDER BY var must be in RETURN" (str var))))
       (cond-> {:find (vec find-vars) :where (mapv vec clauses)}
+        (seq order-by') (assoc :order-by order-by')
         (seq filters) (assoc :filters filters)
         (seq group-by') (assoc :group-by group-by')
         limit (assoc :limit limit)))))
