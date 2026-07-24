@@ -431,13 +431,30 @@
   is the shell's responsibility -- a decrypted hydrated db lives in the
   same trust domain as the shell's own decrypt keys, but it is plaintext
   in memory, so shells must bound entries and never spill this cache to
-  storage."
+  storage.
+
+  Second, colo-shared tier (`:rows-cache-get`/`:rows-cache-put!`, plus
+  optional `:async-get-fn`, all forwarded to kotobase-peer's
+  `hydrate-chain-cached`): the SNAPSHOT rows, serialized, keyed by
+  snapshot-cid -- for shells whose sibling isolates each miss the L1 db
+  cache but share a nearby byte cache (e.g. Cloudflare Cache API). Rows
+  cross that seam decrypted: a shell whose cache medium is less trusted
+  than its own runtime memory must encrypt inside its cache fns (the
+  engine docstring's contract). All keys absent -> plain hydrate-chain,
+  byte-identical behavior."
   [store chain]
   (let [cache-get (:db-cache-get store)
-        cache-put! (:db-cache-put! store)]
+        cache-put! (:db-cache-put! store)
+        rows-get (:rows-cache-get store)
+        rows-put! (:rows-cache-put! store)
+        hydrate (fn []
+                  (if (or rows-get rows-put!)
+                    (eng/hydrate-chain-cached (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)
+                                              rows-get rows-put! (:async-get-fn store))
+                    (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store))))]
     (if-some [cached (when (and cache-get chain) (cache-get chain))]
       cached
-      (then* (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store))
+      (then* (hydrate)
              (fn [db]
                (when (and cache-put! chain) (cache-put! chain db))
                db)))))
