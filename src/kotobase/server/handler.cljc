@@ -413,9 +413,34 @@
   this fn used to hand-roll the equivalent via hot-datoms + a fresh
   `transact` (a workaround from before kotobase-peer had this primitive
   itself, see git history); `hydrate-chain` is kotobase-peer's own, more
-  direct implementation of exactly this, now used instead."
+  direct implementation of exactly this, now used instead.
+
+  Optional memoization seam: a storage shell may supply `:db-cache-get` /
+  `:db-cache-put!` in the store map (`(db-cache-get chain) -> db | nil`,
+  `(db-cache-put! chain db)`; both keyed by the CHAIN CID). A chain CID is
+  a content address over the graph's entire state, so a hydrated db cached
+  under it can never go stale -- a write advances the head to a DIFFERENT
+  chain CID, which is simply a different key; no invalidation protocol
+  exists because none is needed. This is the seam that removes the
+  measured per-request rehydration cost (every `q` re-decrypting every row:
+  ~1.5s CPU at 3,000 datoms, observed live on kotobase-cf-wasm) for
+  storage shells that can hold hot state between requests (e.g. a Worker
+  isolate). Both keys absent -> behavior is byte-identical to before.
+  `db-cache-put!` receives the RESOLVED db value (never a platform
+  Promise), inside the engine's own then* continuation. Bounding/eviction
+  is the shell's responsibility -- a decrypted hydrated db lives in the
+  same trust domain as the shell's own decrypt keys, but it is plaintext
+  in memory, so shells must bound entries and never spill this cache to
+  storage."
   [store chain]
-  (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)))
+  (let [cache-get (:db-cache-get store)
+        cache-put! (:db-cache-put! store)]
+    (if-some [cached (when (and cache-get chain) (cache-get chain))]
+      cached
+      (then* (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store))
+             (fn [db]
+               (when (and cache-put! chain) (cache-put! chain db))
+               db)))))
 
 ;; ── query-literal normalization (wire symmetry with tx-edn->quads) ──────────
 ;; The write path stringifies EVERY non-Link datom position before it reaches
