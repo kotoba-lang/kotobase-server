@@ -36,7 +36,7 @@
                   {:cypher-subset true})))
 
 (def ^:private token-re
-  #"\"[^\"]*\"|'[^']*'|-?[0-9]+(?:\.[0-9]+)?|<-|->|\(|\)|\[|\]|\{|\}|,|:|=|\.|-|[A-Za-z_][A-Za-z0-9_/\-]*")
+  #"\"[^\"]*\"|'[^']*'|-?[0-9]+(?:\.[0-9]+)?|<-|->|<>|<=|>=|<|>|\(|\)|\[|\]|\{|\}|,|:|=|\.|-|[A-Za-z_][A-Za-z0-9_/\-]*")
 
 (defn- tokenize [s] (vec (re-seq token-re s)))
 
@@ -55,6 +55,9 @@
 (defn- ident? [t] (boolean (and t (re-matches #"[A-Za-z_][A-Za-z0-9_/\-]*" t))))
 
 (defn- kw? [t kw] (and (ident? t) (= (str/upper-case t) kw)))
+
+(def ^:private where-ops {"=" := "<>" :not= "<" :< "<=" :<= ">" :> ">=" :>=})
+(def ^:private return-aggs #{"count" "sum" "min" "max" "avg"})
 
 (defn- parse-props
   "After '{': attr : lit [, attr : lit]* '}' -> [rest-tokens clauses]."
@@ -123,29 +126,50 @@
               (if (= "," (first ts))
                 (recur (vec (rest ts)) clauses)
                 [ts clauses])))
-          [ts clauses]
+          [ts clauses filters]
           (if (kw? (first ts) "WHERE")
-            (loop [ts (rest ts) clauses clauses]
-              (let [[v dot k eq lit & more] ts]
-                (when-not (ident? v) (fail "WHERE needs var.attr = literal" v))
+            (loop [ts (rest ts) clauses clauses filters []]
+              (let [[v dot k op lit & more] ts]
+                (when-not (ident? v) (fail "WHERE needs var.attr op literal" v))
                 (when-not (= "." dot) (fail "WHERE needs var.attr" dot))
                 (when-not (ident? k) (fail "WHERE attribute expected" k))
-                (when-not (= "=" eq) (fail "only = comparisons supported in WHERE" eq))
+                (when-not (contains? where-ops op) (fail "unsupported WHERE operator (=, <>, <, <=, >, >= )" op))
                 (when-not (and lit (literal? lit)) (fail "WHERE value must be a literal" lit))
-                (let [clauses (conj clauses [(symbol (str "?" v)) (attr-name k) (literal->value lit)])]
+                (let [[clauses filters]
+                      (if (= "=" op)
+                        [(conj clauses [(symbol (str "?" v)) (attr-name k) (literal->value lit)]) filters]
+                        ;; non-= comparisons: bind the attr to a derived var,
+                        ;; filter as a post-pass (query-exec).
+                        (let [fv (symbol (str "?" v "__" (str/replace k "/" "_")))]
+                          [(conj clauses [(symbol (str "?" v)) (attr-name k) fv])
+                           (conj filters {:var fv :op (get where-ops op) :value (literal->value lit)})]))]
                   (if (kw? (first more) "AND")
-                    (recur (rest more) clauses)
-                    [more clauses]))))
-            [ts clauses])
+                    (recur (rest more) clauses filters)
+                    [more clauses filters]))))
+            [ts clauses []])
           _ (when-not (kw? (first ts) "RETURN") (fail "RETURN required" (first ts)))
           [ts find-vars]
           (loop [ts (rest ts) acc []]
-            (let [[v & more] ts]
-              (when-not (ident? v) (fail "RETURN needs variable names (property access unsupported)" v))
-              (let [acc (conj acc (symbol (str "?" v)))]
-                (if (= "," (first more))
-                  (recur (rest more) acc)
-                  [more acc]))))
+            (cond
+              (and (ident? (first ts)) (contains? return-aggs (str/lower-case (first ts)))
+                   (= "(" (second ts)))
+              (let [[agg _ v close & more] ts]
+                (when-not (ident? v) (fail "aggregate needs a variable" v))
+                (when-not (= ")" close) (fail "aggregate must close with )" close))
+                (let [[alias more] (if (kw? (first more) "AS")
+                                     (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                                         [(symbol (str "?" (second more))) (drop 2 more)])
+                                     [(symbol (str "?" (str/lower-case agg) "_" v)) more])
+                      acc (conj acc {:agg (keyword (str/lower-case agg)) :var (symbol (str "?" v)) :as alias})]
+                  (if (= "," (first more))
+                    (recur (vec (rest more)) acc)
+                    [(vec more) acc])))
+              (ident? (first ts))
+              (let [acc (conj acc (symbol (str "?" (first ts))))]
+                (if (= "," (second ts))
+                  (recur (vec (drop 2 ts)) acc)
+                  [(vec (rest ts)) acc]))
+              :else (fail "RETURN needs variable names or agg(var) (property access unsupported)" (first ts))))
           limit
           (cond
             (empty? ts) nil
@@ -153,9 +177,18 @@
             #?(:clj (Long/parseLong (second ts))
                :cljs (js/parseInt (second ts) 10))
             :else (fail "only LIMIT n allowed after RETURN" (first ts)))
-          bound (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))]
+          bound (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
+          bare-vars (filterv symbol? find-vars)
+          agg-items (filterv map? find-vars)
+          ;; Cypher semantics: aggregates group implicitly by the bare
+          ;; RETURN items.
+          group-by' (when (seq agg-items) (vec bare-vars))]
       (when (empty? clauses) (fail "MATCH produced no bindable clauses" "MATCH"))
-      (doseq [v find-vars]
+      (doseq [v bare-vars]
         (when-not (bound v) (fail "RETURN variable not bound in MATCH/WHERE" (str v))))
+      (doseq [{:keys [var]} agg-items]
+        (when-not (bound var) (fail "aggregate variable not bound in MATCH/WHERE" (str var))))
       (cond-> {:find (vec find-vars) :where (mapv vec clauses)}
+        (seq filters) (assoc :filters filters)
+        (seq group-by') (assoc :group-by group-by')
         limit (assoc :limit limit)))))

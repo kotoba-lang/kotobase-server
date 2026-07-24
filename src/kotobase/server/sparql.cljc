@@ -1,48 +1,52 @@
 (ns kotobase.server.sparql
-  "SPARQL BASIC SUBSET -> the same map-form Datalog `do-q` executes
-  (ADR-2607172500's `graph.sparql` surface; ADR-2607250100 axis 4).
+  "SPARQL SUBSET -> the compiled-query shape `kotobase.server.query-exec`
+  executes over the map-form Datalog engine (ADR-2607172500's
+  `graph.sparql` surface; ADR-2607250100 axis 4, depth pass 2026-07-25).
 
-  Supported, and ONLY this -- an HONEST SUBSET, same doctrine as the
-  handler's other Datomic-cloud approximations (each unsupported form is
+  Supported, and ONLY this -- an HONEST SUBSET (each unsupported form is
   rejected loudly with the supported grammar in the error, never silently
   misread):
 
-    SELECT ?v1 ?v2 ... | SELECT *
-    WHERE { t1 t2 t3 . t4 t5 t6 . ... }   (basic graph patterns only)
-    LIMIT n                                (optional)
+    SELECT ?v ... | SELECT * | SELECT (COUNT(?x) AS ?c) [?v ...]
+      aggregates: COUNT | SUM | MIN | MAX | AVG
+    WHERE { t . t
+            OPTIONAL { t . t }        (left outer join)
+            FILTER(?v op lit) }       (op: = != < <= > >=)
+    GROUP BY ?v ...
+    LIMIT n
 
     term := ?var | <iri> | \"string\" | 'string' | integer | decimal
 
-  Not supported (rejected): PREFIX/BASE, OPTIONAL, FILTER, UNION, GRAPH,
-  ORDER/GROUP BY, DISTINCT, property paths, blank nodes, language tags,
-  datatyped literals (^^), CONSTRUCT/ASK/DESCRIBE, ; and , abbreviations.
+  When aggregates are present, every bare SELECT variable must appear in
+  GROUP BY (no silent first-of-group). Numeric FILTER comparison applies
+  when both sides parse as numbers; lexicographic otherwise -- values are
+  stored as wire strings (`tx-edn->quads` stringification), and <iri>/
+  quoted/number literals compile to that stored-string form.
 
-  Literal representation matches the write path's own stringification
-  (`tx-edn->quads` stores every non-Link position as a string): <iri> and
-  quoted strings compile to their string content, numbers to their decimal
-  string -- the exact coercion `normalize-query-literals` applies to
-  Datalog literals, applied here at compile time."
+  Not supported (rejected): PREFIX/BASE, UNION, GRAPH, ORDER BY,
+  DISTINCT, HAVING, property paths, blank nodes, language tags, ^^typed
+  literals, subqueries, BIND, VALUES, CONSTRUCT/ASK/DESCRIBE, nested
+  OPTIONAL, expressions beyond a single `?var op literal` in FILTER."
   (:require [clojure.string :as str]))
 
 (def grammar-help
-  "supported: SELECT ?v ... | SELECT * WHERE { s p o . s p o } [LIMIT n]; terms: ?var, <iri>, \"string\", 'string', number")
+  "supported: SELECT ?v ...|*|(COUNT(?x) AS ?c) WHERE { s p o . OPTIONAL { s p o } FILTER(?v op lit) } [GROUP BY ?v] [LIMIT n]; ops: = != < <= > >=; aggs: COUNT SUM MIN MAX AVG")
 
 (defn- fail [msg near]
   (throw (ex-info (str "sparql-subset: " msg " (near: " (pr-str near) "). " grammar-help)
                   {:sparql-subset true})))
 
 (def ^:private token-re
-  ;; longest-match-first: iri, quoted strings, vars, numbers, braces, dot,
-  ;; bare words (kept only to produce a good error message).
-  #"<[^>\s]*>|\"[^\"]*\"|'[^']*'|\?[A-Za-z_][A-Za-z0-9_]*|-?[0-9]+(?:\.[0-9]+)?|\{|\}|\.|[^\s{}]+")
+  #"<[^>=\s][^>\s]*>|\"[^\"]*\"|'[^']*'|\?[A-Za-z_][A-Za-z0-9_]*|-?[0-9]+(?:\.[0-9]+)?|\{|\}|\(|\)|\.|!=|<=|>=|=|<|>|[^\s{}()]+")
 
 (defn- tokenize [s] (vec (re-seq token-re s)))
 
 (defn- variable? [t] (str/starts-with? t "?"))
 
-(defn- term->value
-  "Compile one non-variable term to its stored-string representation."
-  [t]
+(def ^:private ops {"=" := "!=" :not= "<" :< "<=" :<= ">" :> ">=" :>=})
+(def ^:private aggs {"COUNT" :count "SUM" :sum "MIN" :min "MAX" :max "AVG" :avg})
+
+(defn- term->value [t]
   (cond
     (and (str/starts-with? t "<") (str/ends-with? t ">")) (subs t 1 (dec (count t)))
     (and (str/starts-with? t "\"") (str/ends-with? t "\"")) (subs t 1 (dec (count t)))
@@ -53,56 +57,125 @@
 (defn- term->pattern [t]
   (if (variable? t) (symbol t) (term->value t)))
 
+(defn- upper [t] (str/upper-case (str t)))
+
+(defn- parse-triples
+  "Triples separated by '.', stopping when stop? matches. -> [ts patterns]"
+  [ts stop?]
+  (loop [ts ts current [] acc []]
+    (cond
+      (empty? ts) (fail "block never closed" "end of query")
+      (stop? (first ts))
+      (let [acc (if (seq current)
+                  (if (= 3 (count current)) (conj acc current)
+                      (fail "pattern must have exactly 3 terms" current))
+                  acc)]
+        [ts acc])
+      (= "." (first ts))
+      (if (= 3 (count current))
+        (recur (rest ts) [] (conj acc current))
+        (fail "pattern must have exactly 3 terms" current))
+      :else
+      (if (= 3 (count current))
+        (fail "pattern must have exactly 3 terms (missing '.'?)" (first ts))
+        (recur (rest ts) (conj current (term->pattern (first ts))) acc)))))
+
+(defn- parse-where-body
+  "After WHERE '{': patterns / OPTIONAL blocks / FILTERs until '}'.
+  -> [ts where optionals filters]"
+  [ts]
+  (loop [ts ts where [] optionals [] filters []]
+    (cond
+      (empty? ts) (fail "WHERE never closed with }" "end of query")
+      (= "}" (first ts)) [(vec (rest ts)) where optionals filters]
+      (= "OPTIONAL" (upper (first ts)))
+      (let [ts (rest ts)]
+        (when-not (= "{" (first ts)) (fail "OPTIONAL must open with {" (first ts)))
+        (let [[ts patterns] (parse-triples (rest ts) #(= "}" %))]
+          (when (empty? patterns) (fail "OPTIONAL block needs at least one pattern" "{}"))
+          (recur (vec (rest ts)) where (conj optionals patterns) filters)))
+      (= "FILTER" (upper (first ts)))
+      (let [[_ open v op lit close & more] ts]
+        (when-not (= "(" open) (fail "FILTER must open with (" open))
+        (when-not (and v (variable? v)) (fail "FILTER needs ?var op literal" v))
+        (when-not (contains? ops op) (fail "unsupported FILTER operator" op))
+        (when-not (and lit (not (contains? #{")" "(" "{" "}"} lit))) (fail "FILTER literal expected" lit))
+        (when-not (= ")" close) (fail "FILTER must close with )" close))
+        (recur (vec more) where optionals
+               (conj filters {:var (symbol v) :op (get ops op) :value (term->value lit)})))
+      (= "." (first ts)) (recur (rest ts) where optionals filters)
+      :else
+      (let [[ts patterns] (parse-triples ts #(or (= "}" %) (= "OPTIONAL" (upper %)) (= "FILTER" (upper %))))]
+        (recur ts (into where patterns) optionals filters)))))
+
+(defn- parse-select
+  "-> [ts find-items star?]; find item = ?var symbol or {:agg :var :as}."
+  [ts]
+  (loop [ts ts acc [] star? false]
+    (cond
+      (empty? ts) (fail "missing WHERE" "end of query")
+      (= "WHERE" (upper (first ts))) [(vec (rest ts)) acc star?]
+      (= "*" (first ts)) (recur (rest ts) acc true)
+      (variable? (first ts)) (recur (rest ts) (conj acc (symbol (first ts))) star?)
+      (= "(" (first ts))
+      (let [[_ agg open v close as c close2 & more] ts]
+        (when-not (contains? aggs (upper agg)) (fail "unsupported aggregate" agg))
+        (when-not (= "(" open) (fail "aggregate needs (?var)" open))
+        (when-not (and v (variable? v)) (fail "aggregate needs a ?var" v))
+        (when-not (= ")" close) (fail "aggregate needs (?var)" close))
+        (when-not (= "AS" (upper as)) (fail "aggregate needs AS ?alias" as))
+        (when-not (and c (variable? c)) (fail "aggregate alias must be a ?var" c))
+        (when-not (= ")" close2) (fail "aggregate must close with )" close2))
+        (recur (vec more) (conj acc {:agg (get aggs (upper agg)) :var (symbol v) :as (symbol c)}) star?))
+      :else (fail "only ?vars, * or (AGG(?v) AS ?a) allowed in SELECT" (first ts)))))
+
 (defn parse
-  "SPARQL subset text -> {:find [?v ...] :where [[s p o] ...] :limit n?}.
-  Throws ex-info {:sparql-subset true} with the supported grammar on
-  anything outside the subset."
+  "SPARQL subset text -> compiled query for kotobase.server.query-exec.
+  Throws ex-info {:sparql-subset true} on anything outside the subset."
   [text]
-  (let [tokens (tokenize (str text))
-        upper (fn [t] (str/upper-case t))]
-    (when (empty? tokens) (fail "empty query" ""))
-    (when-not (= "SELECT" (upper (first tokens))) (fail "must start with SELECT" (first tokens)))
-    (let [[vars rest-tokens]
-          (loop [ts (rest tokens) acc []]
-            (cond
-              (empty? ts) (fail "missing WHERE" "end of query")
-              (= "WHERE" (upper (first ts))) [acc (rest ts)]
-              (= "*" (first ts)) (recur (rest ts) (conj acc :*))
-              (variable? (first ts)) (recur (rest ts) (conj acc (symbol (first ts))))
-              :else (fail "only ?vars or * allowed in SELECT" (first ts))))
-          _ (when (empty? vars) (fail "SELECT needs at least one ?var or *" "WHERE"))
-          _ (when-not (= "{" (first rest-tokens)) (fail "WHERE must open with {" (first rest-tokens)))
-          [patterns after]
-          (loop [ts (rest rest-tokens) current [] acc []]
-            (cond
-              (empty? ts) (fail "WHERE never closed with }" "end of query")
-              (= "}" (first ts))
-              (let [acc (if (seq current)
-                          (if (= 3 (count current)) (conj acc current) (fail "pattern must have exactly 3 terms" current))
-                          acc)]
-                [acc (rest ts)])
-              (= "." (first ts))
-              (if (= 3 (count current))
-                (recur (rest ts) [] (conj acc current))
-                (fail "pattern must have exactly 3 terms" current))
-              :else
-              (if (= 3 (count current))
-                (fail "pattern must have exactly 3 terms (missing '.'?)" (first ts))
-                (recur (rest ts) (conj current (term->pattern (first ts))) acc))))
-          _ (when (empty? patterns) (fail "WHERE needs at least one triple pattern" "{}"))
-          limit (cond
-                  (empty? after) nil
-                  (and (= "LIMIT" (upper (first after)))
-                       (= 2 (count after))
-                       (re-matches #"[0-9]+" (second after)))
-                  #?(:clj (Long/parseLong (second after))
-                     :cljs (js/parseInt (second after) 10))
-                  :else (fail "only LIMIT n allowed after }" (first after)))
-          all-vars (vec (distinct (filter symbol? (mapcat identity patterns))))
-          find-vars (if (some #{:*} vars) all-vars (vec vars))]
-      (doseq [v find-vars]
+  (let [ts (tokenize (str text))]
+    (when (empty? ts) (fail "empty query" ""))
+    (when-not (= "SELECT" (upper (first ts))) (fail "must start with SELECT" (first ts)))
+    (let [[ts find-items star?] (parse-select (vec (rest ts)))
+          _ (when (and (empty? find-items) (not star?)) (fail "SELECT needs ?vars, * or aggregates" "WHERE"))
+          _ (when-not (= "{" (first ts)) (fail "WHERE must open with {" (first ts)))
+          [ts where optionals filters] (parse-where-body (vec (rest ts)))
+          _ (when (empty? where) (fail "WHERE needs at least one triple pattern outside OPTIONAL" "{}"))
+          [ts group-by']
+          (if (and (seq ts) (= "GROUP" (upper (first ts))))
+            (do (when-not (= "BY" (upper (second ts))) (fail "GROUP must be followed by BY" (second ts)))
+                (loop [ts (vec (drop 2 ts)) acc []]
+                  (if (and (seq ts) (variable? (first ts)))
+                    (recur (vec (rest ts)) (conj acc (symbol (first ts))))
+                    (if (empty? acc) (fail "GROUP BY needs at least one ?var" (first ts)) [ts acc]))))
+            [ts []])
+          limit
+          (cond
+            (empty? ts) nil
+            (and (= "LIMIT" (upper (first ts))) (= 2 (count ts)) (re-matches #"[0-9]+" (second ts)))
+            #?(:clj (Long/parseLong (second ts))
+               :cljs (js/parseInt (second ts) 10))
+            :else (fail "only GROUP BY / LIMIT allowed after }" (first ts)))
+          all-vars (vec (distinct (concat (filter symbol? (mapcat identity where))
+                                          (mapcat (fn [ps] (filter symbol? (mapcat identity ps))) optionals))))
+          find-items (if star? (vec (concat all-vars find-items)) find-items)
+          bare-vars (filterv symbol? find-items)
+          agg-items (filterv map? find-items)]
+      (doseq [v bare-vars]
         (when-not (some #{v} all-vars)
-          (fail "SELECT variable not bound in WHERE" (str v))))
-      (cond-> {:find find-vars
-               :where (mapv vec patterns)}
+          (fail "SELECT variable not bound in WHERE/OPTIONAL" (str v))))
+      (doseq [{:keys [var]} agg-items]
+        (when-not (some #{var} all-vars)
+          (fail "aggregate variable not bound in WHERE/OPTIONAL" (str var))))
+      (doseq [f filters]
+        (when-not (some #{(:var f)} all-vars)
+          (fail "FILTER variable not bound in WHERE/OPTIONAL" (str (:var f)))))
+      (when (and (seq agg-items) (seq bare-vars))
+        (doseq [v bare-vars]
+          (when-not (some #{v} group-by')
+            (fail "with aggregates, every bare SELECT var must be in GROUP BY" (str v)))))
+      (cond-> {:find find-items :where where}
+        (seq optionals) (assoc :optionals optionals)
+        (seq filters) (assoc :filters filters)
+        (seq group-by') (assoc :group-by group-by')
         limit (assoc :limit limit)))))
