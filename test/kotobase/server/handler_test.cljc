@@ -854,3 +854,58 @@
                       (is (= 2 (count @db-cache)) "each chain-cid gets its own entry")
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest hot-db-rows-cache-seam-serves-the-snapshot-across-fresh-stores
+  ;; :rows-cache-get/:rows-cache-put! (snapshot-cid-keyed, serialized rows):
+  ;; unlike the L1 db cache (in-process value), this tier survives across
+  ;; store instances -- the shape of "another isolate in the same colo".
+  ;; Only populated once a fold has produced an indexed snapshot.
+  (let [blocks (atom {}) heads (atom {}) rows-cache (atom {}) gets (atom 0)
+        mk-store (fn []
+                   {:get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                    :head-get (fn [graph] (get @heads graph))
+                    :head-put! (fn [graph chain] (swap! heads assoc graph chain))
+                    :blind-fn passthrough :encrypt-fn passthrough :decrypt-fn passthrough
+                    ;; engine contract (hydrate-db-cached): sync bytes|nil on
+                    ;; JVM, Promise-returning on cljs -- a sync value on cljs
+                    ;; throws inside the engine's own .then chain.
+                    :rows-cache-get (fn [k] (passthrough (get @rows-cache k)))
+                    :rows-cache-put! (fn [k s] (passthrough (swap! rows-cache assoc k s)))})
+        store1 (mk-store)
+        q1 (fn [s] (h/handle s "q" {:graph "gr" :query_edn "[nil \":rc/v\" nil]"} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (h/handle store1 "transact"
+                                   {:graph "gr" :tx_edn "[{:db/id \"e1\" :rc/v \"a\"}]"} "did:key:ztest"))))
+         (fn [] (is (:ok (h/handle store1 "fold" {:graph "gr"} nil)) "fold produces the snapshot"))
+         (fn []
+           (let [r (q1 store1)]
+             (is (= 1 (count (:rows r))))
+             (is (= 1 (count @rows-cache)) "snapshot rows cached under its snapshot-cid")))
+         (fn []
+           (let [store2 (mk-store)          ; fresh store value = fresh isolate shape
+                 miss-free-baseline @gets]
+             (reset! gets 0)
+             (let [r (q1 store2)]
+               (is (= 1 (count (:rows r))) "second store answers identically")
+               (is (< @gets miss-free-baseline)
+                   "snapshot came from the rows cache, not a fresh block walk"))))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (h/handle store1 "transact"
+                                           {:graph "gr" :tx_edn "[{:db/id \"e1\" :rc/v \"a\"}]"} "did:key:ztest"))
+             (.then (fn [tx] (is (:ok tx)) (h/handle store1 "fold" {:graph "gr"} nil)))
+             (.then (fn [f] (is (:ok f) "fold produces the snapshot") (q1 store1)))
+             (.then (fn [r]
+                      (is (= 1 (count (:rows r))))
+                      (is (= 1 (count @rows-cache)) "snapshot rows cached under its snapshot-cid")
+                      (let [baseline @gets]
+                        (reset! gets 0)
+                        (-> (js/Promise.resolve (q1 (mk-store)))
+                            (.then (fn [r2]
+                                     (is (= 1 (count (:rows r2))) "second store answers identically")
+                                     (is (< @gets baseline)
+                                         "snapshot came from the rows cache, not a fresh block walk")
+                                     (done)))))))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
