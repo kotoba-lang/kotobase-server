@@ -789,3 +789,68 @@
               (is (not (:ok r)))
               (is (= "AccessDenied" (:error r)))
               (is (nil? ((:head-get store) "kg3")) "denied write never advances the graph head")))])))
+
+(deftest hot-db-memoization-seam
+  ;; :db-cache-get/:db-cache-put! (optional, chain-cid-keyed): a cache HIT
+  ;; must serve `q` without touching :get-fn at all (no rehydration); a
+  ;; write moves the head to a NEW chain-cid, so the next `q` is a MISS
+  ;; (fresh hydration, new cache entry) -- staleness is impossible by
+  ;; construction, not by invalidation.
+  (let [base (mem-store)
+        gets (atom 0)
+        miss-gets (atom 0)
+        db-cache (atom {})
+        store (assoc base
+                     :get-fn (fn [cid] (swap! gets inc) ((:get-fn base) cid))
+                     :db-cache-get (fn [chain] (get @db-cache chain))
+                     :db-cache-put! (fn [chain db] (swap! db-cache assoc chain db)))
+        tx1 (fn [] (h/handle store "transact"
+                             {:graph "gm" :tx_edn "[{:db/id \"e1\" :memo/v \"a\"}]"} "did:key:ztest"))
+        tx2 (fn [] (h/handle store "transact"
+                             {:graph "gm" :tx_edn "[{:db/id \"e2\" :memo/v \"b\"}]"} "did:key:ztest"))
+        q (fn [] (h/handle store "q" {:graph "gm" :query_edn "[nil \":memo/v\" nil]"} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx1))))
+         (fn []
+           (let [r (q)]
+             (is (:ok r))
+             (is (= 1 (count (:rows r))))
+             (is (= 1 (count @db-cache)) "first q populates one chain-cid entry")))
+         (fn []
+           (let [miss-gets @gets]
+             (reset! gets 0)
+             (let [r (q)]
+               (is (= 1 (count (:rows r))))
+               (is (< @gets miss-gets)
+                   "cache hit: no rehydration -- only the O(1) per-request policy read remains"))))
+         (fn [] (is (:ok (tx2))))
+         (fn []
+           (reset! gets 0)
+           (let [r (q)]
+             (is (= 2 (count (:rows r))) "post-write q sees new data (new chain-cid = miss)")
+             (is (pos? @gets) "miss hydrates through :get-fn again")
+             (is (= 2 (count @db-cache)) "each chain-cid gets its own entry")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx1))
+             (.then (fn [tx] (is (:ok tx)) (q)))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= 1 (count (:rows r))))
+                      (is (= 1 (count @db-cache)) "first q populates one chain-cid entry")
+                      (reset! miss-gets @gets)
+                      (reset! gets 0)
+                      (q)))
+             (.then (fn [r]
+                      (is (= 1 (count (:rows r))))
+                      (is (< @gets @miss-gets)
+                          "cache hit: no rehydration -- only the O(1) per-request policy read remains")
+                      (tx2)))
+             (.then (fn [tx] (is (:ok tx)) (reset! gets 0) (q)))
+             (.then (fn [r]
+                      (is (= 2 (count (:rows r))) "post-write q sees new data (new chain-cid = miss)")
+                      (is (pos? @gets) "miss hydrates through :get-fn again")
+                      (is (= 2 (count @db-cache)) "each chain-cid gets its own entry")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
