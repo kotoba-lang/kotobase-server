@@ -962,3 +962,55 @@
                       (is (= "UnsupportedSparql" (:error r)))
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-basic-subset-compiles-to-the-same-rows-as-datalog
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gc" :tx_edn "[{:db/id \"p1\" :sp/name \"alice\" :sp/knows \"p2\"} {:db/id \"p2\" :sp/name \"bob\"}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gc" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (a {sp/name: \"alice\"}) RETURN a")]
+             (is (:ok r))
+             (is (= [["p1"]] (:rows r)))
+             (is (= ["?a"] (:vars r)))))
+         (fn []
+           (let [r (cy "MATCH (a)-[:sp/knows]->(b) RETURN a, b")]
+             (is (:ok r))
+             (is (= [["p1" "p2"]] (:rows r)) "relationship chain compiles to a join clause")))
+         (fn []
+           (let [r (cy "MATCH (a)-[:sp/knows]->(b) WHERE a.sp/name = \"alice\" RETURN b LIMIT 1")]
+             (is (:ok r))
+             (is (= [["p2"]] (:rows r)))))
+         (fn []
+           (let [r (cy "MATCH (a) RETURN a")]
+             (is (false? (:ok r)) "bare unbound node rejected, never an implicit scan")
+             (is (= "UnsupportedCypher" (:error r)))))
+         (fn []
+           (let [r (cy "OPTIONAL MATCH (a {sp/name: \"x\"}) RETURN a")]
+             (is (false? (:ok r)))
+             (is (re-find #"MATCH" (:message r)) "error carries the supported grammar")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy "MATCH (a {sp/name: \"alice\"}) RETURN a")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p1"]] (:rows r)))
+                      (cy "MATCH (a)-[:sp/knows]->(b) RETURN a, b")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p1" "p2"]] (:rows r)))
+                      (cy "MATCH (a)-[:sp/knows]->(b) WHERE a.sp/name = \"alice\" RETURN b LIMIT 1")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p2"]] (:rows r)))
+                      (cy "MATCH (a) RETURN a")))
+             (.then (fn [r]
+                      (is (false? (:ok r)) "bare unbound node rejected")
+                      (is (= "UnsupportedCypher" (:error r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))

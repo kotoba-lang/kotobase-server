@@ -37,6 +37,7 @@
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [kotobase.server.sparql :as sparql]
+            [kotobase.server.cypher :as cypher]
             [multiformats.core :as mf]
             [ipld.core :as ipld]))
 
@@ -599,6 +600,31 @@
                     :vars (mapv str (:find parsed))
                     :rows (vec rows)})))))))
 
+(defn do-cypher
+  "`graph.query` -- CYPHER BASIC SUBSET over the same hot db `do-q` uses.
+  body: {:graph :cypher}. `kotobase.server.cypher/parse` compiles
+  MATCH/WHERE/RETURN basic patterns to the exact map-form Datalog `do-q`
+  executes; anything outside the subset returns {:ok false :error
+  \"UnsupportedCypher\"} with the supported grammar in :message -- the
+  same loudly-rejected-approximation doctrine as `do-sparql`, which this
+  mirrors exactly (parse ns differs, executor identical)."
+  [store {:keys [graph cypher]}]
+  (let [parsed (try (cypher/parse cypher)
+                    (catch #?(:clj Exception :cljs :default) e
+                      (if (:cypher-subset (ex-data e))
+                        {::unsupported #?(:clj (.getMessage ^Exception e) :cljs (ex-message e))}
+                        (throw e))))]
+    (if-some [msg (::unsupported parsed)]
+      {:ok false :error "UnsupportedCypher" :message msg}
+      (let [chain ((:head-get store) graph)]
+        (then* (hot-db store chain)
+               (fn [db]
+                 (let [rows (eng/query db (dissoc parsed :limit) (visible-of store))
+                       rows (if-let [n (:limit parsed)] (take n rows) rows)]
+                   {:ok true :graph graph
+                    :vars (mapv str (:find parsed))
+                    :rows (vec rows)})))))))
+
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
   novelty merge), UNLESS the caller supplies `:pattern_edn` (a Datomic
@@ -1061,6 +1087,7 @@
                 "transact"    (do-transact store body auth)
                 "q"           (do-q store body)
                 "sparql"      (do-sparql store body)
+                "cypher"      (do-cypher store body)
                 "pull"        (do-pull store body)
                 "pullMany"    (do-pull-many store body)
                 "indexPull"   (do-index-pull store body)
@@ -1090,7 +1117,7 @@
       ;; commit metadata and id mappings, no datom content) skip the extra
       ;; narrow read entirely.
       (let [viewer (when (map? auth) auth)
-            row-methods #{"datoms" "q" "sparql" "pull" "pullMany" "indexPull"
+            row-methods #{"datoms" "q" "sparql" "cypher" "pull" "pullMany" "indexPull"
                           "entity" "asOf" "since" "history"
                           "seekDatoms" "indexRange"}
             metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"
