@@ -909,3 +909,56 @@
                                          "snapshot came from the rows cache, not a fresh block walk")
                                      (done)))))))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-basic-subset-compiles-to-the-same-rows-as-datalog
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gs" :tx_edn "[{:db/id \"e1\" :sp/name \"alice\" :sp/age 30} {:db/id \"e2\" :sp/name \"bob\"}]"}
+                            "did:key:ztest"))
+        sparql (fn [q] (h/handle store "sparql" {:graph "gs" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sparql "SELECT ?e WHERE { ?e <:sp/name> \"alice\" }")]
+             (is (:ok r))
+             (is (= [["e1"]] (:rows r)))
+             (is (= ["?e"] (:vars r)))))
+         (fn []
+           (let [r (sparql "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } LIMIT 1")]
+             (is (:ok r))
+             (is (= 1 (count (:rows r))) "LIMIT applied")))
+         (fn []
+           (let [r (sparql "SELECT * WHERE { ?e <:sp/age> ?v }")]
+             (is (:ok r))
+             (is (= [["e1" "30"]] (:rows r)) "SELECT * binds all vars; numbers stored as strings")))
+         (fn []
+           (let [r (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")]
+             (is (false? (:ok r)))
+             (is (= "UnsupportedSparql" (:error r)))
+             (is (re-find #"SELECT" (:message r)) "error carries the supported grammar")))
+         (fn []
+           (let [r (sparql "SELECT ?x WHERE { ?e <:sp/name> ?n }")]
+             (is (false? (:ok r)) "unbound SELECT var rejected")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (sparql "SELECT ?e WHERE { ?e <:sp/name> \"alice\" }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["e1"]] (:rows r)))
+                      (is (= ["?e"] (:vars r)))
+                      (sparql "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } LIMIT 1")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= 1 (count (:rows r))) "LIMIT applied")
+                      (sparql "SELECT * WHERE { ?e <:sp/age> ?v }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["e1" "30"]] (:rows r)))
+                      (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")))
+             (.then (fn [r]
+                      (is (false? (:ok r)))
+                      (is (= "UnsupportedSparql" (:error r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))

@@ -36,6 +36,7 @@
             [clojure.string :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
+            [kotobase.server.sparql :as sparql]
             [multiformats.core :as mf]
             [ipld.core :as ipld]))
 
@@ -571,6 +572,33 @@
                           (eng/q db pat (visible-of store)))]
                {:ok true :graph graph :rows (vec rows)})))))
 
+(defn do-sparql
+  "`graph.sparql` -- SPARQL BASIC SUBSET over the same hot db `do-q` uses.
+  body: {:graph :sparql}. `kotobase.server.sparql/parse` compiles
+  SELECT/WHERE basic-graph-pattern queries to the exact map-form Datalog
+  `do-q` executes (literals pre-coerced to the write path's stored-string
+  representation at compile time, so no second normalization pass);
+  anything outside the subset returns {:ok false :error
+  \"UnsupportedSparql\"} with the supported grammar in :message --
+  loudly-rejected approximation, same doctrine as asOf/indexRange/log.
+  :limit is applied here (the map-form engine path has no limit param)."
+  [store {:keys [graph sparql]}]
+  (let [parsed (try (sparql/parse sparql)
+                    (catch #?(:clj Exception :cljs :default) e
+                      (if (:sparql-subset (ex-data e))
+                        {::unsupported #?(:clj (.getMessage ^Exception e) :cljs (ex-message e))}
+                        (throw e))))]
+    (if-some [msg (::unsupported parsed)]
+      {:ok false :error "UnsupportedSparql" :message msg}
+      (let [chain ((:head-get store) graph)]
+        (then* (hot-db store chain)
+               (fn [db]
+                 (let [rows (eng/query db (dissoc parsed :limit) (visible-of store))
+                       rows (if-let [n (:limit parsed)] (take n rows) rows)]
+                   {:ok true :graph graph
+                    :vars (mapv str (:find parsed))
+                    :rows (vec rows)})))))))
+
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
   novelty merge), UNLESS the caller supplies `:pattern_edn` (a Datomic
@@ -1032,6 +1060,7 @@
                 "datoms"      (do-datoms store body)
                 "transact"    (do-transact store body auth)
                 "q"           (do-q store body)
+                "sparql"      (do-sparql store body)
                 "pull"        (do-pull store body)
                 "pullMany"    (do-pull-many store body)
                 "indexPull"   (do-index-pull store body)
@@ -1061,7 +1090,7 @@
       ;; commit metadata and id mappings, no datom content) skip the extra
       ;; narrow read entirely.
       (let [viewer (when (map? auth) auth)
-            row-methods #{"datoms" "q" "pull" "pullMany" "indexPull"
+            row-methods #{"datoms" "q" "sparql" "pull" "pullMany" "indexPull"
                           "entity" "asOf" "since" "history"
                           "seekDatoms" "indexRange"}
             metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"
