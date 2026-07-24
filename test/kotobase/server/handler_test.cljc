@@ -1101,3 +1101,63 @@
                       (is (= [[1]] (:rows r)))
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-union-and-order-by
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gu" :tx_edn "[{:db/id \"p1\" :u/a \"x\" :u/n 3} {:db/id \"p2\" :u/b \"y\" :u/n 1} {:db/id \"p3\" :u/a \"z\" :u/n 2}]"}
+                            "did:key:ztest"))
+        sq (fn [q] (h/handle store "sparql" {:graph "gu" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sq "SELECT ?e WHERE { { ?e <:u/a> ?v } UNION { ?e <:u/b> ?v } }")]
+             (is (:ok r))
+             (is (= #{["p1"] ["p2"] ["p3"]} (set (:rows r))) "UNION is the bag union of both branches")))
+         (fn []
+           (let [r (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY DESC(?n)")]
+             (is (:ok r))
+             (is (= [["p1" "3"] ["p3" "2"] ["p2" "1"]] (:rows r)) "numeric DESC order")))
+         (fn []
+           (let [r (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY ?n LIMIT 2")]
+             (is (= [["p2" "1"] ["p3" "2"]] (:rows r)) "ASC + LIMIT top-n")))
+         (fn []
+           (let [r (sq "SELECT ?e WHERE { ?e <:u/n> ?n } ORDER BY ?missing")]
+             (is (false? (:ok r)) "ORDER BY unprojected var rejected")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [_] (sq "SELECT ?e WHERE { { ?e <:u/a> ?v } UNION { ?e <:u/b> ?v } }")))
+             (.then (fn [r]
+                      (is (= #{["p1"] ["p2"] ["p3"]} (set (:rows r))))
+                      (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY DESC(?n)")))
+             (.then (fn [r]
+                      (is (= [["p1" "3"] ["p3" "2"] ["p2" "1"]] (:rows r)))
+                      (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY ?n LIMIT 2")))
+             (.then (fn [r]
+                      (is (= [["p2" "1"] ["p3" "2"]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-order-by
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gco" :tx_edn "[{:db/id \"p1\" :o/name \"c\" :o/n 3} {:db/id \"p2\" :o/name \"a\" :o/n 1}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gco" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (p)-[:o/name]->(n) RETURN p, n ORDER BY n")]
+             (is (:ok r))
+             (is (= [["p2" "a"] ["p1" "c"]] (:rows r)) "ORDER BY the name var, ascending")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [_] (cy "MATCH (p)-[:o/name]->(n) RETURN p, n ORDER BY n")))
+             (.then (fn [r]
+                      (is (= [["p2" "a"] ["p1" "c"]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
