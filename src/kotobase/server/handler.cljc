@@ -203,14 +203,29 @@
   `eng/hot-datoms`'s `visible?` is required (ADR-2607050500, same reasoning
   as `do-q`'s `eng/q` call below) -- this handler has no capability/purpose-
   scoped redaction wired in yet, so it passes `(constantly true)`
-  explicitly: today's behavior is unchanged, stated instead of assumed."
+  explicitly: today's behavior is unchanged, stated instead of assumed.
+
+  `:async-get-fn` (optional store key, cljs-only effect, nil-safe) is
+  forwarded to `hot-datoms`'s async arity (kotoba-lang/kotobase-peer#21).
+  Without it every read pays the sync block-miss trampoline's O(N^2)
+  block-discovery cost: `with-blocks` re-runs the WHOLE handler from
+  scratch on each cache miss, so a read touching N blocks executes the
+  read N+1 times. Measured live on backend.kotobase.net (2026-07-25, the
+  cloud-itonami-lei-catalog graph): a `:eavt` scan with `:limit 5` burned
+  32,500ms CPU against a 34,918ms wall clock -- 93% pure CPU, only ~2.4s
+  of actual I/O -- and was killed with `outcome: exceededCpu`, making the
+  graph unreadable at ANY limit. Same failure kotobase-peer#21's own
+  docstring reports from gftdcojp/app-aozora#78 (5130-leaf snapshot: 300s+
+  CPU via the trampoline vs 806ms via the async path). Stores that supply
+  no `:async-get-fn` keep exactly today's behavior."
   [store {:keys [graph index components_edn limit]}]
   (let [chain ((:head-get store) graph)]
     (then* (eng/hot-datoms (:get-fn store) chain
                            {:index (or (index-kw index) :eavt)
                             :components (vec components_edn)
                             :limit limit}
-                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store)
+                           (:async-get-fn store))
            (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
 (defn do-transact
@@ -450,8 +465,17 @@
         cache-put! (:db-cache-put! store)
         rows-get (:rows-cache-get store)
         rows-put! (:rows-cache-put! store)
+        ;; `:async-get-fn` ALONE is enough to take the cached path: with nil
+        ;; cache slots `hydrate-chain-cached` falls back to plain
+        ;; `hydrate-db` behavior for the snapshot (its own docstring's
+        ;; contract) while still routing block discovery through
+        ;; `cold-datoms-async`. Gating this on the rows cache instead would
+        ;; leave every rows-cache-less shell on `hydrate-chain`, which has
+        ;; no async arity at all and therefore keeps paying the sync
+        ;; trampoline's O(N^2) cost -- the same cost that made this graph
+        ;; unreadable (see `do-datoms`).
         hydrate (fn []
-                  (if (or rows-get rows-put!)
+                  (if (or rows-get rows-put! (:async-get-fn store))
                     (eng/hydrate-chain-cached (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)
                                               rows-get rows-put! (:async-get-fn store))
                     (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store))))]
@@ -951,19 +975,48 @@
   including concurrently with a transact or with another fold of the same
   graph -- `fold!` is deterministic/content-addressed, so races converge
   rather than corrupt (the CAS layer in the caller's shell resolves any
-  actual head contention)."
-  [store {:keys [graph]}]
+  actual head contention).
+
+  `max_novelty` (optional, body field; the wire name kotobase-client's
+  `fold` has always sent for its `:max-novelty` opt) bounds one call to the
+  OLDEST that-many not-yet-folded tx blocks instead of folding everything.
+  This handler previously destructured only `:graph`, so the field was
+  accepted on the wire and then SILENTLY DROPPED -- every fold was an
+  unbounded one, which is precisely the runaway `kotobase-peer`'s own
+  `fold!` docstring warns about: novelty can only shrink through a
+  successful fold, so once the backlog is large enough that one unbounded
+  fold exceeds the Worker's CPU budget, the fold that would shrink it can
+  never finish and the graph stays stuck forever. A bounded call makes
+  guaranteed forward progress (novelty strictly shrinks by up to
+  `max_novelty`), so an ops/cron driver can drain any backlog in slices.
+  Non-numeric / non-positive values are ignored (treated as unbounded),
+  never trusted straight from the wire into the engine.
+
+  `:async-get-fn` is forwarded for the same reason `do-datoms` forwards it
+  (see there). Cache slots are deliberately passed as nil: `fold!` keys its
+  hydrate cache by SNAPSHOT cid, while the store's `:db-cache-*` seam is
+  keyed by CHAIN cid -- feeding one into the other would collide two
+  different key spaces.
+
+  Response adds `:novelty_remaining` so a driver can loop until it hits 0
+  without a separate dbStats round-trip."
+  [store {:keys [graph max_novelty]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
-        novelty-n (if chain (eng/novelty-size get-fn chain) 0)]
+        novelty-n (if chain (eng/novelty-size get-fn chain) 0)
+        max-novelty (when (and (number? max_novelty) (pos? max_novelty))
+                      (int max_novelty))]
     (if (zero? novelty-n)
       {:ok true :graph graph :folded false}
-      (then* (eng/fold! (:put! store) get-fn chain
-                        (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store))
+      (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
+                        (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store)
+                        nil nil (:async-get-fn store))
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
-               {:ok true :graph graph :folded true :commit new-chain
-                :previous_commit chain :novelty_folded novelty-n})))))
+               (let [folded-n (if max-novelty (min max-novelty novelty-n) novelty-n)]
+                 {:ok true :graph graph :folded true :commit new-chain
+                  :previous_commit chain :novelty_folded folded-n
+                  :novelty_remaining (- novelty-n folded-n)}))))))
 
 ;; ── blob surface ─────────────────────────────────────────────────────────────
 ;; git-annex / DataLad の content-addressed 大容量バイナリ永続化面（ADR-2607175000）。
