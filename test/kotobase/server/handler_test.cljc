@@ -1161,3 +1161,129 @@
                       (is (= [["p2" "a"] ["p1" "c"]] (:rows r)))
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+;; ── bounded fold (`max_novelty`) ────────────────────────────────────────────
+;; Regression guard for a SILENT wire-field drop: `do-fold` used to
+;; destructure only `:graph`, so kotobase-client's long-standing
+;; `:max-novelty` opt (sent on the wire as `max_novelty`) was accepted and
+;; then ignored -- every fold ran unbounded. That is the exact runaway
+;; kotobase-peer's `fold!` docstring warns about: novelty only shrinks
+;; through a successful fold, so once one unbounded fold no longer fits in
+;; the Worker's CPU budget, nothing can ever shrink it again. Observed live
+;; on backend.kotobase.net 2026-07-25 (`outcome: exceededCpu`, 32.5s CPU).
+
+(defn- fold-steps-clj [store]
+  (doseq [n ["e1" "e2" "e3"]]
+    (is (:ok (h/handle store "transact"
+                       {:graph "bf" :tx_edn (str "[{:db/id \"" n "\" :t/v \"" n "\"}]")}
+                       "did:key:ztest"))))
+  (let [f1 (h/handle store "fold" {:graph "bf" :max_novelty 1} nil)]
+    (is (:ok f1))
+    (is (:folded f1))
+    (is (= 1 (:novelty_folded f1)) "bounded to the oldest 1")
+    (is (= 2 (:novelty_remaining f1)) "the other 2 are left for a later call"))
+  (let [f2 (h/handle store "fold" {:graph "bf" :max_novelty 10} nil)]
+    (is (= 2 (:novelty_folded f2)) "a bound larger than the backlog folds what is there")
+    (is (= 0 (:novelty_remaining f2))))
+  (let [f3 (h/handle store "fold" {:graph "bf" :max_novelty 5} nil)]
+    (is (:ok f3))
+    (is (false? (:folded f3)) "nothing left to fold is still a cheap no-op"))
+  (let [d (h/handle store "datoms" {:graph "bf"} nil)]
+    (is (:ok d))
+    (is (= 3 (count (:datoms d))) "every datom survives being folded in slices")))
+
+(deftest fold-max-novelty-bounds-one-call
+  (let [store (mem-store)]
+    #?(:clj (fold-steps-clj store)
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e1\" :t/v \"e1\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e2\" :t/v \"e2\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e3\" :t/v \"e3\"}]"} "did:key:ztest"))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 1} nil)
+                            (fn [f]
+                              (is (:ok f))
+                              (is (:folded f))
+                              (is (= 1 (:novelty_folded f)) "bounded to the oldest 1")
+                              (is (= 2 (:novelty_remaining f)) "the other 2 are left for a later call"))))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 10} nil)
+                            (fn [f]
+                              (is (= 2 (:novelty_folded f)) "a bound larger than the backlog folds what is there")
+                              (is (= 0 (:novelty_remaining f))))))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 5} nil)
+                            (fn [f]
+                              (is (:ok f))
+                              (is (false? (:folded f)) "nothing left to fold is still a cheap no-op"))))
+              (fn [] (.then (h/handle store "datoms" {:graph "bf"} nil)
+                            (fn [d]
+                              (is (:ok d))
+                              (is (= 3 (count (:datoms d))) "every datom survives being folded in slices"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest fold-ignores-non-positive-max-novelty
+  ;; Never trust a wire number straight into the engine: a 0/negative/non-
+  ;; numeric bound must degrade to the unbounded default, not to "fold
+  ;; nothing" (which would look like success while making no progress).
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"a\" :t/v \"a\"}]"} "did:key:ztest")))
+         (is (:ok (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"b\" :t/v \"b\"}]"} "did:key:ztest")))
+         (let [f (h/handle store "fold" {:graph "bz" :max_novelty 0} nil)]
+           (is (:folded f))
+           (is (= 2 (:novelty_folded f)) "0 is ignored -> unbounded")
+           (is (= 0 (:novelty_remaining f)))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"a\" :t/v \"a\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"b\" :t/v \"b\"}]"} "did:key:ztest"))
+              (fn [] (.then (h/handle store "fold" {:graph "bz" :max_novelty 0} nil)
+                            (fn [f]
+                              (is (:folded f))
+                              (is (= 2 (:novelty_folded f)) "0 is ignored -> unbounded")
+                              (is (= 0 (:novelty_remaining f))))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest datoms-uses-async-get-fn-when-the-store-supplies-one
+  ;; The store seam that closes the O(N^2) trampoline cost: when
+  ;; `:async-get-fn` is present it must actually be REACHED by the read
+  ;; path (a silently-unused seam would look identical in every other
+  ;; assertion, which is how this stayed broken in production).
+  (let [store (mem-store)
+        calls (atom 0)
+        store (assoc store :async-get-fn
+                     (fn [cid]
+                       (swap! calls inc)
+                       #?(:clj ((:get-fn store) cid)
+                          :cljs (js/Promise.resolve ((:get-fn store) cid)))))]
+    #?(:clj
+       ;; :clj has no async path by contract (hot-datoms' async-get-fn is
+       ;; a :cljs-only effect) -- assert only that supplying it is inert
+       ;; there, never that it is called.
+       (do
+         (is (:ok (h/handle store "transact" {:graph "ag" :tx_edn "[{:db/id \"x\" :t/v \"x\"}]"} "did:key:ztest")))
+         (is (:ok (h/handle store "fold" {:graph "ag"} nil)))
+         (let [d (h/handle store "datoms" {:graph "ag"} nil)]
+           (is (:ok d))
+           (is (= 1 (count (:datoms d))))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "ag" :tx_edn "[{:db/id \"x\" :t/v \"x\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "ag"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "datoms" {:graph "ag"} nil)
+                            (fn [d]
+                              (is (:ok d))
+                              (is (= 1 (count (:datoms d))))
+                              (is (pos? @calls)
+                                  "the snapshot half went through async-get-fn, not the sync trampoline"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
