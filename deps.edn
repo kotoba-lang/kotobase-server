@@ -11,7 +11,9 @@
  ;; kotobase.server.ipns requires kotobase.ipns (kotobase-client), whose
  ;; verify-head calls did-key->ed25519-pub directly to resolve the
  ;; signer's pubkey for every IPNS record signature check.
- :deps {io.github.kotoba-lang/kotobase-peer
+ :deps {io.github.kotoba-lang/kotobase-storage
+        {:local/root "../kotobase-storage"}
+        io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
         io.github.kotoba-lang/kotobase-client
