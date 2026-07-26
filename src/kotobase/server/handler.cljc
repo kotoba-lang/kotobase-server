@@ -999,24 +999,58 @@
   different key spaces.
 
   Response adds `:novelty_remaining` so a driver can loop until it hits 0
-  without a separate dbStats round-trip."
-  [store {:keys [graph max_novelty]}]
+  without a separate dbStats round-trip.
+
+  `views_edn` (optional, body field; kotobase-client's `fold` `:views` opt,
+  `pr-str`'d — see client.cljs) declares/updates materialized views: a map
+  of `{view-name {\"attrs\" [attr ...]}}`, or `{view-name nil}` to remove
+  one. This handler previously destructured only `:graph`/`:max_novelty`,
+  so a caller's view declaration was silently dropped even when the fold
+  itself succeeded — `do-view`/`datomic.view` had nothing to read from
+  because `eng/fold!` was always called with `views=nil`. Threaded through
+  now via `eng/fold!`'s own `views` param (`materialize-views!` merges it
+  with whatever views the PREVIOUS fold already stored, so a fold call
+  that omits `views_edn` entirely leaves existing view declarations
+  untouched — it does not need to re-declare them every time)."
+  [store {:keys [graph max_novelty views_edn]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
         novelty-n (if chain (eng/novelty-size get-fn chain) 0)
         max-novelty (when (and (number? max_novelty) (pos? max_novelty))
-                      (int max_novelty))]
-    (if (zero? novelty-n)
+                      (int max_novelty))
+        views (when (string? views_edn) (edn/read-string views_edn))]
+    (if (and (zero? novelty-n) (nil? views))
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store)
-                        nil nil (:async-get-fn store))
+                        nil nil (:async-get-fn store) views)
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                (let [folded-n (if max-novelty (min max-novelty novelty-n) novelty-n)]
                  {:ok true :graph graph :folded true :commit new-chain
                   :previous_commit chain :novelty_folded folded-n
                   :novelty_remaining (- novelty-n folded-n)}))))))
+
+(defn do-view
+  "`datomic.view` -- rows of a fold-materialized view (ADR-2607166600),
+  always fresh: the fold-time view rows with unfolded novelty merged on
+  top (retractions cancel stored rows; novelty assertions matching the
+  view's declared attrs are appended). body: {:graph :view}.
+
+  `{:ok false :error \"ViewNotFound\"}` when the view isn't declared (a
+  prior `datomic.fold` with `:views {view-name spec}` declares it) or the
+  graph has no head yet -- unlike `do-datoms`, an absent view is a real
+  error rather than an empty read: a typo'd view name silently returning
+  empty rows would be far harder to notice than an explicit rejection."
+  [store {:keys [graph view]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (when chain
+             (eng/view-rows (:get-fn store) chain view
+                            (visible-of store) (:decrypt-fn store)))
+           (fn [result]
+             (if result
+               (merge {:ok true :graph graph} result)
+               {:ok false :error "ViewNotFound"})))))
 
 ;; ── blob surface ─────────────────────────────────────────────────────────────
 ;; git-annex / DataLad の content-addressed 大容量バイナリ永続化面（ADR-2607175000）。
@@ -1147,6 +1181,7 @@
                 "pullMany"    (do-pull-many store body)
                 "indexPull"   (do-index-pull store body)
                 "fold"        (do-fold store body)
+                "view"        (do-view store body)
                 "entity"      (do-entity store body)
                 "entid"       (do-entid store body)
                 "ident"       (do-ident store body)
@@ -1174,7 +1209,7 @@
       (let [viewer (when (map? auth) auth)
             row-methods #{"datoms" "q" "sparql" "cypher" "pull" "pullMany" "indexPull"
                           "entity" "asOf" "since" "history"
-                          "seekDatoms" "indexRange"}
+                          "seekDatoms" "indexRange" "view"}
             metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"
                                "txRange" "log" "sync"}
             policy-methods (into row-methods metadata-methods)

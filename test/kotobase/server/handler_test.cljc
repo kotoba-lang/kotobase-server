@@ -1250,6 +1250,104 @@
             (.then (fn [_] (done)))
             (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
 
+;; ── materialized views (`datomic.view`, ADR-2607166600) ─────────────────────
+;; Regression guard for the SAME class of silent wire-field drop as
+;; fold-max-novelty above: `do-fold` used to destructure `:graph`/
+;; `:max_novelty` but never `:views_edn`, so a caller's view declaration
+;; was accepted on the wire and silently dropped -- `do-view`/`datomic.view`
+;; had nothing to read because `eng/fold!` was always called with
+;; `views=nil`. There was also no `"view"` case in `handle` at all.
+
+(deftest fold-with-views-declares-a-view-then-view-reads-it-fresh
+  (let [store (mem-store)
+        view-spec {"v1" {"attrs" [":t/v"]}}
+        steps
+        [(fn [] (h/handle store "transact" {:graph "vw" :tx_edn "[{:db/id \"e1\" :t/v \"a\"} {:db/id \"e2\" :other/attr \"x\"}]"} "did:key:ztest"))
+         (fn [] (h/handle store "fold" {:graph "vw" :views_edn (pr-str view-spec)} nil))
+         (fn [] (h/handle store "transact" {:graph "vw" :tx_edn "[{:db/id \"e3\" :t/v \"b\"}]"} "did:key:ztest"))]]
+    #?(:clj
+       (do
+         (doseq [step (butlast steps)] (step))
+         (let [fold-resp ((second steps))]
+           (is (:ok fold-resp))
+           (is (:folded fold-resp) "a view declaration forces the fold even with novelty to spare"))
+         ((last steps))
+         (let [v (h/handle store "view" {:graph "vw" :view "v1"} nil)]
+           (is (:ok v))
+           (is (= 2 (count (:rows v))) "1 folded row + 1 fresh novelty row for the declared attr")
+           (is (every? #(= ":t/v" (:a %)) (:rows v)) "only the declared attr, :other/attr excluded")))
+       :cljs
+       (async
+        done
+        (-> ((first steps))
+            (.then (fn [_]
+                     (.then ((second steps))
+                            (fn [fold-resp]
+                              (is (:ok fold-resp))
+                              (is (:folded fold-resp) "a view declaration forces the fold even with novelty to spare")))))
+            (.then (fn [_] ((nth steps 2))))
+            (.then (fn [_] (h/handle store "view" {:graph "vw" :view "v1"} nil)))
+            (.then (fn [v]
+                     (is (:ok v))
+                     (is (= 2 (count (:rows v))) "1 folded row + 1 fresh novelty row for the declared attr")
+                     (is (every? #(= ":t/v" (:a %)) (:rows v)) "only the declared attr, :other/attr excluded")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest fold-with-views-forces-the-fold-even-below-novelty-threshold
+  ;; Same silent-drop failure mode fold-max-novelty guards against, for
+  ;; the OTHER path into it: a caller can fold+declare a view in one call
+  ;; right after a PRIOR fold already cleared novelty to 0. Below-threshold
+  ;; folds are ordinarily a cheap no-op (see fold-ignores-non-positive-
+  ;; max-novelty) -- but that no-op must not also silently eat the view
+  ;; declaration.
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "vw2" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")))
+         (is (:folded (h/handle store "fold" {:graph "vw2"} nil)) "clears novelty to 0 first")
+         (let [f (h/handle store "fold" {:graph "vw2" :views_edn (pr-str {"v2" {"attrs" [":t/v"]}})} nil)]
+           (is (:ok f))
+           (is (:folded f) "views forces the fold to actually run despite zero novelty"))
+         (let [v (h/handle store "view" {:graph "vw2" :view "v2"} nil)]
+           (is (:ok v))
+           (is (= 1 (count (:rows v))))))
+       :cljs
+       (async
+        done
+        (-> (h/handle store "transact" {:graph "vw2" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")
+            (.then (fn [_] (h/handle store "fold" {:graph "vw2"} nil)))
+            (.then (fn [f0] (is (:folded f0) "clears novelty to 0 first")))
+            (.then (fn [_] (h/handle store "fold" {:graph "vw2" :views_edn (pr-str {"v2" {"attrs" [":t/v"]}})} nil)))
+            (.then (fn [f]
+                     (is (:ok f))
+                     (is (:folded f) "views forces the fold to actually run despite zero novelty")))
+            (.then (fn [_] (h/handle store "view" {:graph "vw2" :view "v2"} nil)))
+            (.then (fn [v]
+                     (is (:ok v))
+                     (is (= 1 (count (:rows v))))
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest view-is-not-found-when-undeclared
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "vw3" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")))
+         (let [v (h/handle store "view" {:graph "vw3" :view "nope"} nil)]
+           (is (false? (:ok v)))
+           (is (= "ViewNotFound" (:error v)))))
+       :cljs
+       (async
+        done
+        (-> (h/handle store "transact" {:graph "vw3" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")
+            (.then (fn [_] (h/handle store "view" {:graph "vw3" :view "nope"} nil)))
+            (.then (fn [v]
+                     (is (false? (:ok v)))
+                     (is (= "ViewNotFound" (:error v)))
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
 (deftest datoms-uses-async-get-fn-when-the-store-supplies-one
   ;; The store seam that closes the O(N^2) trampoline cost: when
   ;; `:async-get-fn` is present it must actually be REACHED by the read
