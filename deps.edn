@@ -12,7 +12,8 @@
  ;; verify-head calls did-key->ed25519-pub directly to resolve the
  ;; signer's pubkey for every IPNS record signature check.
  :deps {io.github.kotoba-lang/kotobase-storage
-        {:local/root "../kotobase-storage"}
+        {:git/url "https://github.com/kotoba-lang/kotobase-storage.git"
+         :git/sha "5cbf6c5107ad49c0daac14dca118c837053de0d6"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
