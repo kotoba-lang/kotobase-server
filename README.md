@@ -42,7 +42,17 @@ kotobase.server.ipns          -- pure decision logic for
 kotobase.server.runtime       -- platform-neutral block/head/claim/authority/
                                  KMS/audit ports and fail-closed service
                                  validation for secured network runtimes
+kotobase.server.shadow        -- failure-isolated primary/shadow comparison;
+                                 deployment owns sampling, waitUntil scheduling,
+                                 normalization and telemetry
 ```
+
+`kotobase.server.shadow/wrap-handler` is the migration seam from the legacy
+`kotobase-peer` path to an `IEngine` adapter. The primary response is always
+authoritative. A deployment injects a same-shape shadow handler, removes
+expected physical differences through `normalize`, and schedules the task via
+its own lifetime primitive (for Workers, `ctx.waitUntil`). This repository does
+not choose an engine or hide mismatches by changing the public response.
 
 Storage adapters (R2/B2/IndexedDB), the actual HTTP/`Response` shell, routes,
 and product policy are the consumer's job. CACAO/delegation verification,
