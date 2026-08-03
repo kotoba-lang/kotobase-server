@@ -38,6 +38,7 @@
             [clojure.string :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
+            [kotobase.server.materialized :as materialized]
             [kotobase.server.sparql :as sparql]
             [kotobase.server.cypher :as cypher]
             [kotobase.server.query-exec :as qx]
@@ -129,24 +130,6 @@
   calling do-* directly) → fully public, the pre-Phase-3 behavior."
   [store]
   (or (:visible? store) (constantly true)))
-
-(defn- visible-attr? [store attr]
-  ((visible-of store) {:a (str attr)}))
-
-(defn- redact-pulled
-  "Attr-level redaction over eng/pull / eng/entity result trees — those
-  read a hydrated db VALUE and bypass the row-level visible? seam, so the
-  handler filters their attr-keyed maps (recursively: nested pull
-  patterns return nested attr maps)."
-  [store v]
-  (cond
-    (map? v) (into {} (keep (fn [[k vv]]
-                              (when (visible-attr? store k)
-                                [k (redact-pulled store vv)]))
-                            v))
-    (set? v) (into #{} (map #(redact-pulled store %)) v)
-    (sequential? v) (mapv #(redact-pulled store %) v)
-    :else v))
 
 (defn- owned-entities
   "Entity ids the viewer OWNS per the policy's :owner-attrs (Phase 3c,
@@ -594,12 +577,9 @@
         pat (normalize-query-literals (edn/read-string query_edn))]
     (then* (hot-db store chain)
            (fn [db]
-             (let [rows (if (and (map? pat) (or (contains? pat :find) (contains? pat :where)))
-                          (if inputs_edn
-                            (eng/query db pat (visible-of store)
-                                       (mapv wire-literal (edn/read-string inputs_edn)))
-                            (eng/query db pat (visible-of store)))
-                          (eng/q db pat (visible-of store)))]
+             (let [inputs (when inputs_edn
+                            (mapv wire-literal (edn/read-string inputs_edn)))
+                   rows (materialized/query-db db pat (visible-of store) inputs)]
                {:ok true :graph graph :rows (vec rows)})))))
 
 (defn- run-compiled-graph-query
@@ -680,7 +660,8 @@
           pattern (edn/read-string pattern_edn)]
       (then* (hot-db store chain)
              (fn [db] {:ok true :graph graph :entity entity
-                       :result_edn (pr-str (redact-pulled store (eng/pull db entity pattern)))})))
+                       :result_edn (pr-str (materialized/pull db entity pattern
+                                                            (visible-of store)))})))
     (let [chain ((:head-get store) graph)]
       (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
                              (visible-of store) (:blind-fn store) (:decrypt-fn store))
@@ -699,7 +680,8 @@
     (then* (hot-db store chain)
            (fn [db]
              {:ok true :graph graph
-              :results_edn (mapv #(pr-str (redact-pulled store (eng/pull db % pattern))) entities)}))))
+              :results_edn (mapv pr-str (materialized/pull-many db entities pattern
+                                                               (visible-of store)))}))))
 
 (defn do-index-pull
   "`datomic.indexPull` -- Datomic's index-based pull, a comparatively
@@ -727,7 +709,7 @@
   (let [chain ((:head-get store) graph)]
     (then* (hot-db store chain)
            (fn [db] {:ok true :graph graph :entity entity
-                     :entity_edn (pr-str (redact-pulled store (eng/entity db entity)))}))))
+                     :entity_edn (pr-str (materialized/entity db entity (visible-of store)))}))))
 
 (defn do-entid
   "`datomic.entid` -- resolve an id-or-ident to the actual entity id
@@ -741,7 +723,7 @@
   (let [chain ((:head-get store) graph)]
     (then* (hot-db store chain)
            (fn [db] {:ok true :graph graph
-                     :entity_id (eng/entid db (edn/read-string ident_edn))}))))
+                     :entity_id (materialized/entid db (edn/read-string ident_edn))}))))
 
 (defn do-ident
   "`datomic.ident` -- the inverse of `entid`: the `:db/ident` keyword an
@@ -753,7 +735,7 @@
   (let [chain ((:head-get store) graph)]
     (then* (hot-db store chain)
            (fn [db] {:ok true :graph graph :entity entity
-                     :ident_edn (pr-str (eng/ident db entity))}))))
+                     :ident_edn (pr-str (materialized/ident db entity))}))))
 
 (defn do-as-of
   "`datomic.asOf` -- a `datoms`-shaped read of the graph AS OF commit `t`
