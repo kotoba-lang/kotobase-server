@@ -1385,3 +1385,56 @@
                                   "the snapshot half went through async-get-fn, not the sync trampoline"))))])
             (.then (fn [_] (done)))
             (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest write-policy-reads-use-async-get-fn-after-fold
+  ;; A write still performs one narrow policy lookup. Once a graph has an
+  ;; indexed snapshot that lookup must use the same async block-discovery
+  ;; seam as ordinary reads; otherwise cljs falls back to sync scan-prefix
+  ;; inside a Promise continuation and leaks/retries block-miss one node at
+  ;; a time. Cover both shared write gates: transact and KG.
+  (let [store (mem-store)
+        calls (atom 0)
+        store (assoc store :async-get-fn
+                     (fn [cid]
+                       (swap! calls inc)
+                       #?(:clj ((:get-fn store) cid)
+                          :cljs (js/Promise.resolve ((:get-fn store) cid)))))]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact"
+                            {:graph "aw" :tx_edn "[{:db/id \"e1\" :t/v 1}]"}
+                            "did:key:ztest")))
+         (is (:ok (h/handle store "fold" {:graph "aw"} nil)))
+         (is (:ok (h/handle store "transact"
+                            {:graph "aw" :tx_edn "[{:db/id \"e2\" :t/v 2}]"}
+                            "did:key:ztest"))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact"
+                              {:graph "aw" :tx_edn "[{:db/id \"e1\" :t/v 1}]"}
+                              "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "aw"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "transact"
+                                     {:graph "aw" :tx_edn "[{:db/id \"e2\" :t/v 2}]"}
+                                     "did:key:ztest")
+                            (fn [result]
+                              (is (:ok result))
+                              (is (pos? @calls)
+                                  "transact policy lookup used async block discovery"))))
+              (fn [] (h/handle store "kg.ingest"
+                              {:graph "kg-aw" :id "kg-1" :type "test"}
+                              "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "kg-aw"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "kg.ingest"
+                                     {:graph "kg-aw" :id "kg-2" :type "test"}
+                                     "did:key:ztest")
+                            (fn [result]
+                              (is (:ok result))
+                              (is (pos? @calls)
+                                  "KG policy lookup used async block discovery"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))

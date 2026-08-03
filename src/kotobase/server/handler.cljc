@@ -23,6 +23,8 @@
     :blind-fn    (fn [component])    -> blinded string | Promise<string>
     :encrypt-fn  (fn [bytes])        -> ciphertext | Promise<ciphertext>
     :decrypt-fn  (fn [bytes])        -> plaintext | Promise<plaintext>
+    :async-get-fn (fn [cid])         -> Promise<bytes> (optional, cljs;
+                                          avoids sync snapshot discovery)
 
   Extracted 2026-07-07 from `kotoba-lang/kotobase-cljc-worker`'s
   `handler.cljc` (the live implementation behind `kotobase.aozora.app` as of
@@ -254,7 +256,8 @@
         policy-rows (if prev-chain
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
-                                      (constantly true) (:blind-fn store) (:decrypt-fn store))
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                      (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* policy-rows
            (fn [rows]
@@ -379,7 +382,8 @@
         policy-rows (if prev-chain
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
-                                      (constantly true) (:blind-fn store) (:decrypt-fn store))
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                      (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* policy-rows
            (fn [rows]
