@@ -11,12 +11,18 @@
  ;; kotobase.server.ipns requires kotobase.ipns (kotobase-client), whose
  ;; verify-head calls did-key->ed25519-pub directly to resolve the
  ;; signer's pubkey for every IPNS record signature check.
- :deps {io.github.kotoba-lang/kotobase-peer
+ :deps {;; datom-source is the IPatternSource contract kotobase.server.
+        ;; pattern-source implements (superproject ADR-2608039970). Zero deps
+        ;; of its own; kotobase-client carries the shared index plan.
+        io.github.kotoba-lang/datom-source
+        {:git/url "https://github.com/kotoba-lang/datom-source.git"
+         :git/sha "b42f6e6ff942c7f8a2856f8142ebffc13aa11098"}
+        io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
-         :git/sha "a1799ffaa20557ba9b3eb956d4978c865734aa49"}
+         :git/sha "6ab16b54f0804575b5b8d8d264b9ae20c9699227"}
         ;; src/kotobase/server/storage.cljc (landed via #13's untracked-WIP
         ;; cleanup, 2026-07-26) requires kotobase.storage.core, but nothing
         ;; declared this dependency -- main's own CI has been red since that

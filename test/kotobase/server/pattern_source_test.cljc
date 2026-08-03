@@ -1,0 +1,115 @@
+(ns kotobase.server.pattern-source-test
+  "The property that has to hold before anything is switched over: a pattern
+  source and the materialized path answer the SAME datoms. If they disagree,
+  swapping a query surface from one to the other silently changes results,
+  and no test of either alone would say so."
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            [datom.source :as src]
+            [kotobase.server.handler :as h]
+            [kotobase.server.pattern-source :as ps]))
+
+(defn- passthrough [x] #?(:clj x :cljs (js/Promise.resolve x)))
+
+(defn- mem-store []
+  (let [blocks (atom {}) heads (atom {})]
+    {:get-fn (fn [cid] (get @blocks cid))
+     :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+     :head-get (fn [graph] (get @heads graph))
+     :head-put! (fn [graph chain] (swap! heads assoc graph chain))
+     :blind-fn passthrough
+     :encrypt-fn passthrough
+     :decrypt-fn passthrough}))
+
+(defn- then* [x f] #?(:clj (f x) :cljs (.then (js/Promise.resolve x) f)))
+
+(defn- run
+  "Thread steps across the platform split, like handler-test's own runner."
+  [steps]
+  #?(:clj (doseq [s steps] (s))
+     :cljs (async done
+             (-> (reduce (fn [p s] (.then p (fn [_] (s))))
+                         (js/Promise.resolve nil) steps)
+                 (.then (fn [_] (done)))
+                 (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(def ^:private tx
+  (str "[{:db/id \"e1\" :name \"Alice\" :role \"admin\"}"
+       " {:db/id \"e2\" :name \"Bob\" :role \"user\"}"
+       " {:db/id \"e3\" :name \"Carol\" :role \"admin\"}]"))
+
+(defn- rows->quads [rows]
+  (into #{} (map (fn [{:keys [e a v_edn]}] {:s e :p a :o v_edn})) rows))
+
+(deftest a-full-scan-source-answers-what-do-datoms-answers
+  (testing "the equivalence the switch depends on"
+    (let [store (mem-store)]
+      (run
+       [(fn [] (then* (h/handle store "transact" {:graph "g" :tx_edn tx} "did:key:ztest")
+                      (fn [resp] (is (:ok resp)))))
+        (fn []
+          (then* (h/handle store "datoms" {:graph "g" :index "eavt"} nil)
+                 (fn [{:keys [datoms]}]
+                   (then* (ps/source-for store ((:head-get store) "g") [[nil nil nil]])
+                          (fn [source]
+                            (is (= (rows->quads datoms)
+                                   (src/scan-set source [nil nil nil]))
+                                "same datoms, whichever way they were read"))))))]))))
+
+(deftest a-predicate-pattern-reads-only-that-predicate
+  (testing "the point of the pushdown: a query naming one attribute reads one
+            index range, not the graph"
+    (let [store (mem-store)]
+      (run
+       [(fn [] (then* (h/handle store "transact" {:graph "g2" :tx_edn tx} "did:key:ztest")
+                      (fn [resp] (is (:ok resp)))))
+        (fn []
+          (then* (ps/source-for store ((:head-get store) "g2") [[nil ":role" nil]])
+                 (fn [source]
+                   (let [got (src/scan-set source [nil ":role" nil])]
+                     (is (= 3 (count got)))
+                     (is (every? #(= ":role" (:p %)) got)
+                         "nothing outside the pattern was read into the source")))))]))))
+
+(deftest a-bound-object-narrows-further
+  (let [store (mem-store)]
+    (run
+     [(fn [] (then* (h/handle store "transact" {:graph "g3" :tx_edn tx} "did:key:ztest")
+                    (fn [resp] (is (:ok resp)))))
+      (fn []
+        (then* (ps/source-for store ((:head-get store) "g3")
+                              [[nil ":role" "\"admin\""]])
+               (fn [source]
+                 (is (= #{"e1" "e3"}
+                        (into #{} (map :s)
+                              (src/scan-set source [nil ":role" "\"admin\""])))
+                     "the object is filtered at scan time against the STORED
+                      form the rows carry; the read itself is the predicate's
+                      range (see object-unbound for why the value component is
+                      not pushed yet)"))))])))
+
+(deftest a-graph-with-nothing-written-is-an-empty-source
+  (testing "not an error — the same posture do-datoms takes"
+    (let [store (mem-store)]
+      (run
+       [(fn []
+          (then* (ps/source-for store ((:head-get store) "never-written") [[nil nil nil]])
+                 (fn [source]
+                   (is (= #{} (src/scan-set source [nil nil nil]))))))]))))
+
+(deftest visible-is-threaded-into-the-read-not-applied-after
+  (testing "a row the viewer may not see is never materialized into a quad.
+            Note the predicate takes the ROW shape ({:e :a :v_edn :added}),
+            which is what hot-datoms forwards — NOT datom.source's {:s :p :o}.
+            A {:s :p :o} predicate here matches nothing and hides nothing"
+    (let [store (mem-store)]
+      (run
+       [(fn [] (then* (h/handle store "transact" {:graph "g4" :tx_edn tx} "did:key:ztest")
+                      (fn [resp] (is (:ok resp)))))
+        (fn []
+          (then* (ps/source-for store ((:head-get store) "g4") [[nil nil nil]]
+                                (fn [{:keys [e]}] (not= e "e2")))
+                 (fn [source]
+                   (let [got (src/scan-set source [nil nil nil])]
+                     (is (seq got))
+                     (is (not-any? #(= "e2" (:s %)) got))))))]))))

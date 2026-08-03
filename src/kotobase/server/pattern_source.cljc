@@ -1,0 +1,126 @@
+(ns kotobase.server.pattern-source
+  "`datom.source/IPatternSource` over `hot-datoms` — the in-process half of
+  the Datomic-API-as-an-index seam (superproject ADR-2608039970).
+
+  ## What it replaces, and why that matters
+
+  Every compiled-query read here goes through `hot-db`: hydrate the whole
+  chain into a db value, then run an algebra over it. That is O(database) per
+  query regardless of how few rows come back — `datom.source`'s own docstring
+  names this as the reason it exists.
+
+  `hot-datoms` is already the shape that avoids it: a filtered index read
+  (`:index` + prefix `:components`, snapshot + novelty merge, range-pruned on
+  the snapshot side, never a whole-graph rehydrate). One triple pattern is
+  one `hot-datoms` call. A query naming two predicates reads two index
+  ranges, whatever the graph's size.
+
+  ## The plan is shared, deliberately
+
+  Which index answers which bound positions lives in
+  `kotobase.datom-plan` (`kotoba-lang/kotobase-client`), the same namespace
+  `kotobase.datom-source` uses for the HTTP transport. Two transports, one
+  plan: if the in-process reads and the remote reads ever disagreed about
+  which index answers `[_ p o]`, the two would return different answers to
+  the same query and nothing would say so.
+
+  ## Async construction, synchronous scanning
+
+  `-scan` is synchronous by contract and `kotoba-lang/sparql`'s algebra walks
+  it synchronously, while `hot-datoms` is a value on JVM and a Promise on
+  cljs (ADR-2607051000). So `source-for` PREFETCHES the patterns a query
+  names and hands back a plain source over the result — the same split
+  `kotobase-protocols-worker` uses for documents, and the same one
+  `kotobase.datom-source` uses over HTTP.
+
+  What is read is the query's patterns. Not the database.
+
+  ## Two contracts that look alike and are not
+
+  **Pattern values are the STORED wire representation, not logical values.**
+  A datom's object comes back as `v_edn` — `\"admin\"` is stored as the four
+  characters `\\\"admin\\\"`. A caller holding a literal parsed out of query
+  text must put it through `wire-value` first, or `[_ p o]` plans a perfectly
+  good `:avet` read that matches nothing. This is the same coercion
+  `kotobase.server.sparql` already does at compile time (\"literals
+  pre-coerced to the write path's stored-string representation\"), stated
+  here because a source is the other place it has to happen.
+
+  **`visible?` here is the ROW-shaped predicate**, over
+  `{:e :a :v_edn :added}` — that is what `hot-datoms` forwards to both its
+  snapshot and novelty halves. It is NOT `datom.source`'s `{:s :p :o}`
+  predicate, despite the identical name and the identical purpose. A
+  `{:s :p :o}` predicate handed to `source-for` silently matches nothing and
+  therefore hides nothing."
+  (:require [datom.source :as src]
+            [kotobase-peer.core :as eng]
+            [kotobase.datom-plan :as plan]))
+
+(defn- then*
+  "The platform split, same as `kotobase.server.handler`'s: kotobase-peer's
+  crypto-touching fns are values on JVM and `js/Promise`s on cljs."
+  [x f]
+  #?(:clj (f x)
+     :cljs (.then (js/Promise.resolve x) f)))
+
+(defn- all*
+  "Await a seq of per-read results into a seq of results."
+  [xs]
+  #?(:clj (vec xs)
+     :cljs (.then (js/Promise.all (clj->js (vec xs))) #(vec (array-seq %)))))
+
+(defn- object-unbound
+  "Drop the object from a pattern before planning.
+
+  MEASURED 2026-08-04 against `hot-datoms` on a fresh graph holding one
+  datom `[e1 :role \"admin\"]` (rows report `:v_edn \"\\\"admin\\\"\"`):
+
+    :avet components [\":role\"]                    -> 1 row
+    :avet components [\":role\" \"\\\"admin\\\"\"]        -> 0 rows
+    :avet components [\":role\" \"admin\"]            -> 1 row
+    :aevt components [\":role\"]                    -> 1 row
+
+  So the value component IS applied (the encoded form filters everything
+  out), and it wants the RAW value while the row reports the encoded one. A
+  one-datom corpus cannot separate `applied and matched` from `ignored`,
+  which is exactly the ambiguity that must not be guessed at: a value
+  component read wrongly returns FEWER rows, and fewer rows is a wrong query
+  answer that looks like an empty result.
+
+  Until that is characterized, the object is not pushed. `[_ p o]` reads the
+  predicate's range and `datom.source/of-quads` filters the object at scan
+  time — a superset read, never a wrong answer. The predicate pushdown, which
+  IS verified, is what makes this O(that attribute) instead of O(database)."
+  [[s p _]]
+  [s p nil])
+
+(defn read-quads
+  "One planned read -> its asserted quads.
+
+  `visible?` is threaded into `hot-datoms` itself rather than applied after,
+  so a row the viewer may not see is never materialized into a quad — the
+  same place `do-datoms` applies it (ADR-2607050500, ADR-2607174500 3b)."
+  [store chain {:keys [index components]} visible?]
+  (then* (eng/hot-datoms (:get-fn store) chain
+                         {:index (keyword index) :components (vec components)}
+                         visible? (:blind-fn store) (:decrypt-fn store)
+                         (:async-get-fn store))
+         (fn [rows] (plan/rows->quads identity rows))))
+
+(defn source-for
+  "Prefetch `patterns` from `chain` -> an `IPatternSource` over their union.
+  A value on JVM, a Promise on cljs.
+
+  Patterns planning to the same read are issued once: two patterns of one
+  query routinely differ only in a position that index's prefix cannot bind,
+  and issuing it twice is two reads for one answer.
+
+  A nil `chain` (a graph with nothing written yet) is an empty source, not an
+  error — the same posture `do-datoms` takes."
+  ([store chain patterns] (source-for store chain patterns (constantly true)))
+  ([store chain patterns visible?]
+   (if (nil? chain)
+     (then* nil (fn [_] (src/of-quads [])))
+     (then* (all* (map #(read-quads store chain % visible?)
+                       (plan/reads (map object-unbound patterns))))
+            (fn [quad-sets] (src/of-quads (plan/union-quads quad-sets)))))))
