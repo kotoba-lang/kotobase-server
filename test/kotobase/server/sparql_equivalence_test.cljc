@@ -51,15 +51,36 @@
    ;; existing handler test rejects `SELECT ?e WHERE { OPTIONAL {...} }` for
    ;; an unbound projection var, not for OPTIONAL itself. Assuming otherwise
    ;; is how a \"the new one does more\" claim gets written without checking.
-   "SELECT ?e ?a WHERE { ?e <:sp/name> ?n . OPTIONAL { ?e <:sp/age> ?a } }"])
+   "SELECT ?e ?a WHERE { ?e <:sp/name> ?n . OPTIONAL { ?e <:sp/age> ?a } }"
+
+   ;; ── the rest of the old grammar. Its own `grammar-help` names UNION,
+   ;; GROUP BY, ORDER BY, LIMIT and COUNT/SUM/MIN/MAX/AVG, and a swap has to
+   ;; hold for all of it, not just the shapes that were easy to check first.
+   "SELECT ?e WHERE { { ?e <:sp/name> \"alice\" } UNION { ?e <:sp/name> \"bob\" } }"
+   "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } ORDER BY ?n"
+   "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } ORDER BY DESC(?n)"
+   "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } LIMIT 1"
+   ;; aggregates are NOT here — see `aggregates-are-a-real-coverage-gap`.
+   ])
+
+(def ^:private aggregate-queries
+  ["SELECT (COUNT(?e) AS ?c) WHERE { ?e <:sp/name> ?n }"
+   "SELECT ?n (COUNT(?e) AS ?c) WHERE { ?e <:sp/name> ?n } GROUP BY ?n"])
+
+(defn- ordered?
+  "Does this query pin its own row order?"
+  [q] (boolean (re-find #"(?i)ORDER\s+BY" q)))
 
 (defn- normalize
-  "Compare as SETS of rows keyed by var name. Neither implementation promises
-  row ORDER without an ORDER BY, so comparing vectors would fail on a
-  difference SPARQL itself says is not one."
-  [{:keys [vars rows]}]
-  {:vars (set vars)
-   :rows (set (map (fn [row] (zipmap vars row)) rows))})
+  "Rows keyed by var name. A SET unless the query said ORDER BY — neither
+  implementation promises order without one, so comparing vectors there
+  would fail on a difference SPARQL itself says is not one. WITH an ORDER
+  BY, order is the thing under test and a set would hide a disagreement
+  about it."
+  [ordered? {:keys [vars rows]}]
+  (let [as-maps (map (fn [row] (zipmap vars row)) rows)]
+    {:vars (set vars)
+     :rows (if ordered? (vec as-maps) (set as-maps))}))
 
 (deftest both-implementations-answer-the-same-rows
   (let [store (mem-store)]
@@ -75,7 +96,8 @@
                                       (testing q
                                         (is (:ok old) "the subset answers this query")
                                         (is (:ok new') "so does the protocol path")
-                                        (is (= (normalize old) (normalize new'))
+                                        (is (= (normalize (ordered? q) old)
+                                               (normalize (ordered? q) new'))
                                             "same vars, same rows"))))))))
                 both-should-answer)))))
 
@@ -113,3 +135,34 @@
                    (is (false? (:ok r)))
                    (is (= "UnsupportedSparql" (:error r)))
                    (is (re-find #"SELECT only" (:message r))))))]))))
+
+(deftest aggregates-are-a-real-coverage-gap-the-other-way
+  (testing "THE BLOCKER for retiring the subset, pinned so it cannot be
+            forgotten. The old subset supports COUNT/SUM/MIN/MAX/AVG and
+            GROUP BY — its own grammar-help lists them. kotoba-lang/sparql's
+            algebra has NO aggregation node at all (bgp/filter/join/union/
+            optional/project/distinct/order-by/slice), so the protocol path
+            cannot express these and refuses them.
+
+            Coverage is therefore NOT nested: the protocol path adds DISTINCT
+            and the graph forms, the subset has aggregates, and neither
+            dominates. Switching graph.sparql over as-is would take COUNT
+            away from every caller using it."
+    (let [store (mem-store)]
+      (run
+       (into [(fn [] (then* (h/handle store "transact" {:graph "agg" :tx_edn tx} "did:key:ztest")
+                            (fn [r] (is (:ok r)))))]
+             (map (fn [q]
+                    (fn []
+                      (then* (h/handle store "sparql" {:graph "agg" :sparql q} nil)
+                             (fn [old]
+                               (then* (spp/do-sparql store {:graph "agg" :sparql q} nil)
+                                      (fn [new']
+                                        (testing q
+                                          (is (:ok old)
+                                              "the subset answers aggregates")
+                                          (is (false? (:ok new'))
+                                              "the protocol path cannot, and says so
+                                               rather than answering something else")
+                                          (is (= "UnsupportedSparql" (:error new'))))))))))
+                  aggregate-queries))))))
