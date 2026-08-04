@@ -105,6 +105,29 @@
       (:left node) (update :left coerce-algebra)
       (:right node) (update :right coerce-algebra))))
 
+(defn- pattern-vars
+  "Every variable an algebra tree could bind: the vars in its triple
+  patterns, plus the output var of every aggregate (which the group
+  produces rather than matches)."
+  [node]
+  (if-not (map? node)
+    #{}
+    (into (set (concat (mapcat (fn [p] (filter symbol? p)) (:patterns node))
+                       (map :var (:aggregates node))))
+          (mapcat pattern-vars [(:pattern node) (:left node) (:right node)]))))
+
+(defn- unbound-projection
+  "A SELECT var that nothing in the WHERE could ever bind, or nil.
+
+  SPARQL says such a var is simply unbound, and the protocol path would
+  answer `[[nil] [nil]]` — one useless row per solution. The subset this
+  replaces refused it instead, and refusing is the kinder answer: nobody
+  writes `SELECT ?x` meaning `give me a column of nothing`, so it is a typo
+  every time. Kept on the swap deliberately."
+  [output-vars algebra]
+  (let [bindable (pattern-vars algebra)]
+    (first (remove bindable output-vars))))
+
 (defn- vars-of
   "`head.vars` order: the query's own projection, or — for `SELECT *` —
   every var seen across the rows in first-seen order. Same rule
@@ -150,6 +173,13 @@
        :message (str "graph.sparql answers SELECT only; " (name (:form parsed))
                      " returns a graph or a boolean, which this response shape "
                      "cannot carry — use the SPARQL 1.1 Protocol HTTP surface")}
+
+      (unbound-projection (:output-vars parsed) (:algebra parsed))
+      {:ok false :error "UnsupportedSparql"
+       :message (str "SELECT names " (unbound-projection (:output-vars parsed)
+                                                         (:algebra parsed))
+                     ", which nothing in the WHERE can bind — it would answer a "
+                     "column of unbound values")}
 
       :else
       ;; Coerce FIRST, then derive the patterns from the coerced algebra.

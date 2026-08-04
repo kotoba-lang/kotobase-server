@@ -39,7 +39,7 @@
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [kotobase.server.materialized :as materialized]
-            [kotobase.server.sparql :as sparql]
+            [kotobase.server.sparql-protocol :as spp]
             [kotobase.server.cypher :as cypher]
             [kotobase.server.query-exec :as qx]
             [multiformats.core :as mf]
@@ -598,24 +598,19 @@
                {:ok true :graph graph :vars vars :rows rows})))))
 
 (defn do-sparql
-  "`graph.sparql` -- SPARQL BASIC SUBSET over the same hot db `do-q` uses.
-  body: {:graph :sparql}. `kotobase.server.sparql/parse` compiles
-  SELECT/WHERE basic-graph-pattern queries to the exact map-form Datalog
-  `do-q` executes (literals pre-coerced to the write path's stored-string
-  representation at compile time, so no second normalization pass);
-  anything outside the subset returns {:ok false :error
-  \"UnsupportedSparql\"} with the supported grammar in :message --
-  loudly-rejected approximation, same doctrine as asOf/indexRange/log.
-  :limit is applied here (the map-form engine path has no limit param)."
-  [store {:keys [graph sparql]}]
-  (let [parsed (try (sparql/parse sparql)
-                    (catch #?(:clj Exception :cljs :default) e
-                      (if (:sparql-subset (ex-data e))
-                        {::unsupported #?(:clj (.getMessage ^Exception e) :cljs (ex-message e))}
-                        (throw e))))]
-    (if-some [msg (::unsupported parsed)]
-      {:ok false :error "UnsupportedSparql" :message msg}
-      (run-compiled-graph-query store graph parsed))))
+  "`graph.sparql` -- the SPARQL 1.1 Protocol implementation
+  (`kotoba-lang/org-w3-sparql-protocol` + `kotoba-lang/sparql`'s algebra)
+  over index reads rather than a hydrated db. body: {:graph :sparql}.
+
+  Was a 233-line hand-written subset compiling to map-form Datalog over
+  `hot-db`. Retired (superproject ADR-2608039970) once
+  `test/kotobase/server/sparql_snapshot_test.cljc` showed the two answering
+  identically across that subset's WHOLE grammar -- BGP, joins, OPTIONAL,
+  UNION, ORDER BY, LIMIT, aggregates with and without GROUP BY, and FILTER.
+  That suite is now a snapshot of those answers, so the behaviour the swap
+  preserved is still pinned with the old implementation gone."
+  [store body]
+  (spp/do-sparql store body (visible-of store)))
 
 (defn do-cypher
   "`graph.query` -- CYPHER BASIC SUBSET over the same hot db `do-q` uses.
