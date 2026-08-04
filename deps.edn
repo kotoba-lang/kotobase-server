@@ -35,7 +35,7 @@
          :git/sha "b3d13b8175ce032622f7604615e914da9f292c59"}
         io.github.kotoba-lang/org-w3-sparql-protocol
         {:git/url "https://github.com/kotoba-lang/org-w3-sparql-protocol.git"
-         :git/sha "f061d541d26c9f69c7dffb339abcce0f4c136abd"}
+         :git/sha "56953c0a1371db67bc9d86e6cfa43e0e5793be4a"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
