@@ -165,3 +165,63 @@
                  (fn [r]
                    (is (false? (:ok r)))
                    (is (= "UnsupportedSparql" (:error r))))))]))))
+
+;; ── beyond the retired subset ───────────────────────────────────────────────
+;; These have no snapshot: the subset's FILTER grammar was a single
+;; `?var op literal`, so && / || / ! / BOUND were rejected outright. There is
+;; nothing to compare against and no equivalence to preserve — only the new
+;; behaviour to state.
+
+(deftest boolean-filters-work
+  (let [store (mem-store)]
+    (run
+     [(fn [] (then* (h/handle store "transact" {:graph "bool" :tx_edn tx} "did:key:ztest")
+                    (fn [r] (is (:ok r)))))
+      (fn []
+        (then* (h/handle store "sparql"
+                         {:graph "bool"
+                          :sparql (str "SELECT ?e WHERE { ?e <:sp/name> ?n . ?e <:sp/age> ?v . "
+                                       "FILTER(?v > 25 && ?n != \"bob\") }")} nil)
+               (fn [r]
+                 (is (:ok r))
+                 (is (= [["e1"]] (:rows r))))))
+      (fn []
+        (then* (h/handle store "sparql"
+                         {:graph "bool"
+                          :sparql (str "SELECT ?e WHERE { ?e <:sp/name> ?n . "
+                                       "FILTER(?n = \"alice\" || ?n = \"bob\") }")} nil)
+               (fn [r]
+                 (is (:ok r))
+                 (is (= #{["e1"] ["e2"]} (set (:rows r)))))))
+      (fn []
+        (then* (h/handle store "sparql"
+                         {:graph "bool"
+                          :sparql (str "SELECT ?e WHERE { ?e <:sp/name> ?n . "
+                                       "FILTER(!(?n = \"bob\")) }")} nil)
+               (fn [r]
+                 (is (:ok r))
+                 (is (= [["e1"]] (:rows r))))))])))
+
+(deftest bound-distinguishes-an-optional-that-matched
+  (testing "the reason BOUND exists: an OPTIONAL leaves the var absent, and
+            only BOUND can tell that from a value"
+    (let [store (mem-store)]
+      (run
+       [(fn [] (then* (h/handle store "transact" {:graph "bnd" :tx_edn tx} "did:key:ztest")
+                      (fn [r] (is (:ok r)))))
+        (fn []
+          (then* (h/handle store "sparql"
+                           {:graph "bnd"
+                            :sparql (str "SELECT ?e WHERE { ?e <:sp/name> ?n . "
+                                         "OPTIONAL { ?e <:sp/age> ?a } FILTER(BOUND(?a)) }")} nil)
+                 (fn [r]
+                   (is (:ok r))
+                   (is (= [["e1"]] (:rows r)) "only the one with an age"))))
+        (fn []
+          (then* (h/handle store "sparql"
+                           {:graph "bnd"
+                            :sparql (str "SELECT ?e WHERE { ?e <:sp/name> ?n . "
+                                         "OPTIONAL { ?e <:sp/age> ?a } FILTER(!BOUND(?a)) }")} nil)
+                 (fn [r]
+                   (is (:ok r))
+                   (is (= [["e2"]] (:rows r)) "and the one without"))))]))))

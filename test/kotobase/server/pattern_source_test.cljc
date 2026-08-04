@@ -121,3 +121,39 @@
                    (let [got (src/scan-set source [nil nil nil])]
                      (is (seq got))
                      (is (not-any? #(= "e2" (:s %)) got))))))]))))
+
+(deftest the-object-position-is-pushed-into-avet
+  (testing "the measurement that unblocked it: three datoms on one attribute,
+            two sharing a value. A value component that were IGNORED would
+            answer 3; one applied to the wrong representation would answer 0.
+            It answers 2, and the right 2"
+    (let [store (mem-store)]
+      (run
+       [(fn [] (then* (h/handle store "transact"
+                                {:graph "avet"
+                                 :tx_edn (str "[{:db/id \"e1\" :role \"admin\"}"
+                                              " {:db/id \"e2\" :role \"user\"}"
+                                              " {:db/id \"e3\" :role \"admin\"}]")}
+                                "did:key:ztest")
+                      (fn [r] (is (:ok r)))))
+        (fn []
+          (then* (h/handle store "datoms"
+                           {:graph "avet" :index "avet" :components_edn [":role" "admin"]} nil)
+                 (fn [{:keys [datoms]}]
+                   (is (= #{"e1" "e3"} (set (map :e datoms)))
+                       "filters, and on the STORED value"))))
+        (fn []
+          (then* (h/handle store "datoms"
+                           {:graph "avet" :index "avet" :components_edn [":role" "\"admin\""]} nil)
+                 (fn [{:keys [datoms]}]
+                   (is (= [] (vec datoms))
+                       "the ENCODED form matches nothing — which is how the
+                        ambiguity was resolved: a component that were ignored
+                        could not tell these two apart"))))
+        (fn []
+          (then* (ps/source-for store ((:head-get store) "avet") [[nil ":role" "admin"]])
+                 (fn [source]
+                   (is (= #{"e1" "e3"}
+                          (into #{} (map :s) (src/scan-set source [nil ":role" "admin"])))
+                       "and the source uses it — one avet range read, not a
+                        predicate scan filtered afterwards"))))]))))
