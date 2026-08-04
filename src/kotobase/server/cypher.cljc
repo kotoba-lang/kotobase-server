@@ -35,10 +35,30 @@
   (throw (ex-info (str "cypher-subset: " msg " (near: " (pr-str near) "). " grammar-help)
                   {:cypher-subset true})))
 
+;; `token-re` の最後の `[^\s]` は「どの正規トークンにもならなかった 1 文字」を
+;; 捕まえるためだけにある。これが無いと `re-seq` は未知文字を **黙って捨てて**
+;; しまい、この ns が docstring で約束している「never silently misread」を破る。
+;; 実測で 2 件の silent misread が出た(openCypher TCK 走査、2026-08-04):
+;;   `-[:r*]->`   可変長パスの `*` が消えて 1 ホップの `-[:r]->` になっていた
+;;   `WHERE a.n =~ "x"`  正規表現マッチの `~` が消えて **等値比較**になっていた
+;; どちらもエラーではなく「違う質問の答え」を返す。
 (def ^:private token-re
+  #"\"[^\"]*\"|'[^']*'|-?[0-9]+(?:\.[0-9]+)?|<-|->|<>|<=|>=|<|>|\(|\)|\[|\]|\{|\}|,|:|=|\.|-|[A-Za-z_][A-Za-z0-9_/\-]*|[^\s]")
+
+;; 上と同じ選択肢から catch-all だけを除いたもの。full match で「正規トークンか」を判定する。
+(def ^:private valid-token-re
   #"\"[^\"]*\"|'[^']*'|-?[0-9]+(?:\.[0-9]+)?|<-|->|<>|<=|>=|<|>|\(|\)|\[|\]|\{|\}|,|:|=|\.|-|[A-Za-z_][A-Za-z0-9_/\-]*")
 
-(defn- tokenize [s] (vec (re-seq token-re s)))
+(defn- tokenize
+  "Cypher subset のトークン列。subset の語彙に無い文字は捨てずに loud reject する。
+  末尾のセミコロン 1 個だけは Cypher の慣用なので取り除いて許す(意味を変えない)。"
+  [s]
+  (let [s (str/replace (str/trimr (str s)) #";$" "")
+        ts (vec (re-seq token-re s))]
+    (doseq [t ts]
+      (when-not (re-matches valid-token-re t)
+        (fail "character outside the supported subset (it would otherwise be dropped and change the query's meaning)" t)))
+    ts))
 
 (defn- literal? [t]
   (or (str/starts-with? t "\"") (str/starts-with? t "'")
