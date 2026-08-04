@@ -65,7 +65,15 @@
    ;; org-w3-sparql-protocol#9 (parsing it). They are equivalence cases now,
    ;; which is the whole point: the coverage is nested at last.
    "SELECT (COUNT(?e) AS ?c) WHERE { ?e <:sp/name> ?n }"
-   "SELECT ?n (COUNT(?e) AS ?c) WHERE { ?e <:sp/name> ?n } GROUP BY ?n"])
+   "SELECT ?n (COUNT(?e) AS ?c) WHERE { ?e <:sp/name> ?n } GROUP BY ?n"
+
+   ;; FILTER — the last piece of the old grammar, and the one with the
+   ;; type problem: the write path stringifies, so `?v > 25` compares a
+   ;; string to a number unless both surfaces use the same rule
+   ;; (org-w3-sparql-protocol#10).
+   "SELECT ?e WHERE { ?e <:sp/age> ?v . FILTER(?v > 25) }"
+   "SELECT ?e WHERE { ?e <:sp/age> ?v . FILTER(?v < 25) }"
+   "SELECT ?e ?n WHERE { ?e <:sp/name> ?n . FILTER(?n != \"bob\") }"])
 
 (defn- ordered?
   "Does this query pin its own row order?"

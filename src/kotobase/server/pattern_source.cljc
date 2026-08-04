@@ -37,14 +37,16 @@
 
   ## Two contracts that look alike and are not
 
-  **Pattern values are the STORED wire representation, not logical values.**
-  A datom's object comes back as `v_edn` — `\"admin\"` is stored as the four
-  characters `\\\"admin\\\"`. A caller holding a literal parsed out of query
-  text must put it through `wire-value` first, or `[_ p o]` plans a perfectly
-  good `:avet` read that matches nothing. This is the same coercion
-  `kotobase.server.sparql` already does at compile time (\"literals
-  pre-coerced to the write path's stored-string representation\"), stated
-  here because a source is the other place it has to happen.
+  **Quads carry STORED VALUES, not `v_edn`.** A row reports the object as
+  `v_edn` — its EDN encoding — and this decodes one level, so `:o` is the
+  value the write path actually stored. The write path stringifies, so
+  `:sp/age 30` is the string `\"30\"` here, not the number.
+
+  That is the representation a consumer can work in: a FILTER comparing
+  `?v > 25` can parse `\"30\"`, and cannot do anything sensible with the
+  seven characters of `v_edn`. Pattern components are in the same
+  representation — a caller holding a logical value passes `(str v)`, not
+  `(pr-str v)`.
 
   **`visible?` here is the ROW-shaped predicate**, over
   `{:e :a :v_edn :added}` — that is what `hot-datoms` forwards to both its
@@ -52,7 +54,8 @@
   predicate, despite the identical name and the identical purpose. A
   `{:s :p :o}` predicate handed to `source-for` silently matches nothing and
   therefore hides nothing."
-  (:require [datom.source :as src]
+  (:require #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])
+            [datom.source :as src]
             [kotobase-peer.core :as eng]
             [kotobase.datom-plan :as plan]))
 
@@ -105,7 +108,10 @@
                          {:index (keyword index) :components (vec components)}
                          visible? (:blind-fn store) (:decrypt-fn store)
                          (:async-get-fn store))
-         (fn [rows] (plan/rows->quads identity rows))))
+         (fn [rows]
+           (into #{}
+                 (map (fn [q] (update q :o #(when (string? %) (edn/read-string %)))))
+                 (plan/rows->quads identity rows)))))
 
 (defn source-for
   "Prefetch `patterns` from `chain` -> an `IPatternSource` over their union.
