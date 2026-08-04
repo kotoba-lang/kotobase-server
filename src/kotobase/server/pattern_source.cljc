@@ -35,6 +35,24 @@
 
   What is read is the query's patterns. Not the database.
 
+  ## The object position IS pushed down, and here is the measurement
+
+  It was withheld at first because a one-datom corpus cannot tell `applied
+  and matched` from `ignored`, and a value component read wrongly returns
+  FEWER rows — a wrong answer that looks like an empty result. Measured
+  2026-08-04 against three datoms on one attribute, two of them sharing a
+  value (`e1 :role admin`, `e2 :role user`, `e3 :role admin`):
+
+    :avet (no components)                -> 3 rows
+    :avet components [\":role\"]           -> 3 rows
+    :avet components [\":role\" \"admin\"]   -> 2 rows, exactly e1 and e3
+    :avet components [\":role\" \"\\\"admin\\\"\"] -> 0 rows
+    :aevt components [\":role\"]           -> 3 rows
+
+  So the value component IS applied, it filters correctly, and it wants the
+  STORED value — which is exactly what quads carry here. `[_ p o]` is one
+  `:avet` range read now instead of a predicate scan filtered afterwards.
+
   ## Two contracts that look alike and are not
 
   **Quads carry STORED VALUES, not `v_edn`.** A row reports the object as
@@ -72,31 +90,6 @@
   #?(:clj (vec xs)
      :cljs (.then (js/Promise.all (clj->js (vec xs))) #(vec (array-seq %)))))
 
-(defn- object-unbound
-  "Drop the object from a pattern before planning.
-
-  MEASURED 2026-08-04 against `hot-datoms` on a fresh graph holding one
-  datom `[e1 :role \"admin\"]` (rows report `:v_edn \"\\\"admin\\\"\"`):
-
-    :avet components [\":role\"]                    -> 1 row
-    :avet components [\":role\" \"\\\"admin\\\"\"]        -> 0 rows
-    :avet components [\":role\" \"admin\"]            -> 1 row
-    :aevt components [\":role\"]                    -> 1 row
-
-  So the value component IS applied (the encoded form filters everything
-  out), and it wants the RAW value while the row reports the encoded one. A
-  one-datom corpus cannot separate `applied and matched` from `ignored`,
-  which is exactly the ambiguity that must not be guessed at: a value
-  component read wrongly returns FEWER rows, and fewer rows is a wrong query
-  answer that looks like an empty result.
-
-  Until that is characterized, the object is not pushed. `[_ p o]` reads the
-  predicate's range and `datom.source/of-quads` filters the object at scan
-  time — a superset read, never a wrong answer. The predicate pushdown, which
-  IS verified, is what makes this O(that attribute) instead of O(database)."
-  [[s p _]]
-  [s p nil])
-
 (defn read-quads
   "One planned read -> its asserted quads.
 
@@ -127,6 +120,5 @@
   ([store chain patterns visible?]
    (if (nil? chain)
      (then* nil (fn [_] (src/of-quads [])))
-     (then* (all* (map #(read-quads store chain % visible?)
-                       (plan/reads (map object-unbound patterns))))
+     (then* (all* (map #(read-quads store chain % visible?) (plan/reads patterns)))
             (fn [quad-sets] (src/of-quads (plan/union-quads quad-sets)))))))
