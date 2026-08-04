@@ -17,6 +17,25 @@
         io.github.kotoba-lang/datom-source
         {:git/url "https://github.com/kotoba-lang/datom-source.git"
          :git/sha "b42f6e6ff942c7f8a2856f8142ebffc13aa11098"}
+        ;; PIN ALIGNMENT, and it is load-bearing. org-w3-sparql-protocol pulls
+        ;; kotobase-query -> arrangement 9e90426, which tools.deps selects over
+        ;; the f4e3118 kotobase-peer depends on (:newer-version wins silently).
+        ;; Measured 2026-08-04: taking the surface WITHOUT these three pins
+        ;; turned 78/332 green into 16 failures in fold and hot-db caching —
+        ;; the engine's own libraries swapped out from under it by a query
+        ;; surface's transitive tree. Top-level deps win, so they are stated.
+        io.github.kotoba-lang/arrangement
+        {:git/url "https://github.com/kotoba-lang/arrangement.git"
+         :git/sha "f4e3118f8431e60259f501ee539773af3b35b1d3"}
+        io.github.kotoba-lang/io-ipld
+        {:git/url "https://github.com/kotoba-lang/io-ipld.git"
+         :git/sha "4591764514239c4777f227a7a56d46c901e2a4a0"}
+        io.github.kotoba-lang/prolly-tree
+        {:git/url "https://github.com/kotoba-lang/prolly-tree.git"
+         :git/sha "b3d13b8175ce032622f7604615e914da9f292c59"}
+        io.github.kotoba-lang/org-w3-sparql-protocol
+        {:git/url "https://github.com/kotoba-lang/org-w3-sparql-protocol.git"
+         :git/sha "f061d541d26c9f69c7dffb339abcce0f4c136abd"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
