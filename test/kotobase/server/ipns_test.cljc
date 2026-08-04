@@ -11,15 +11,23 @@
 
 (def seed (js/Uint8Array.from (into-array (range 32))))
 
+;; The name `seed`'s public key actually derives (ipns.core/pubkey->name of
+;; ed25519 pub for this seed). It was "k51test" until 2026-08-04 -- a string
+;; that names no key at all -- and every test here passed, because
+;; verify-head checked the signature and not the binding. That is the same
+;; hole this suite now covers from the other side; superproject
+;; ADR-2608047000.
+(def owner-name "k51qzi5uqu5dg9ufswxt229ntzdy7p4125xzv5rtyjso89ajdujg6csfxcj260")
+
 (defn- signed [sequence]
-  (ipns/sign-head seed {:name "k51test" :value "bafyreicid-example"
+  (ipns/sign-head seed {:name owner-name :value "bafyreicid-example"
                          :sequence sequence :valid_until "2027-01-01T00:00:00Z"}))
 
 (deftest head-response-formats-a-found-and-a-missing-record
   (testing "nil record -> 404 NotFound"
     (is (= {:ok false :error "NotFound" :status 404} (sipns/head-response nil))))
   (testing "a present record -> merged with :ok true :status 200"
-    (let [record {:name "k51test" :value "bafyreicid-example" :sequence 3}]
+    (let [record {:name owner-name :value "bafyreicid-example" :sequence 3}]
       (is (= (assoc record :ok true :status 200) (sipns/head-response record))))))
 
 (deftest verify-and-decide-publish-accepts-a-first-publish
@@ -75,3 +83,28 @@
             the rollback guard for this name"
     (is (= {:ok false :error "InvalidSequence" :status 400}
            (sipns/verify-and-decide-publish (signed 1) (signed "abc"))))))
+
+(deftest verify-and-decide-publish-refuses-a-name-takeover
+  ;; The gate this endpoint IS: authority over a name, checked before a
+  ;; sequence that would otherwise wave the record straight through. Both
+  ;; records below are genuinely signed -- the attacker signs their own
+  ;; record perfectly well. What they do not hold is the key `owner-name`
+  ;; names. Superproject ADR-2608047000.
+  (let [attacker-seed (js/Uint8Array.from (into-array (range 1 33)))
+        forged (ipns/sign-head attacker-seed
+                               {:name owner-name :value "bafyreiattackercontrolled"
+                                :sequence 9999 :valid_until "2027-01-01T00:00:00Z"})]
+    (testing "a valid signature by a key the name does not name is not authority"
+      (is (= {:ok false :error "InvalidSignature" :status 401}
+             (sipns/verify-and-decide-publish forged nil))))
+    (testing "and a sequence far above the current head does not buy it in"
+      (is (= {:ok false :error "InvalidSignature" :status 401}
+             (sipns/verify-and-decide-publish forged (signed 4)))))
+    (testing "the owner's own publish at the same sequence still works --
+              this refuses forgery, not the endpoint"
+      (is (= {:ok true}
+             (sipns/verify-and-decide-publish
+              (ipns/sign-head seed {:name owner-name :value "bafyreiowner"
+                                    :sequence 9999
+                                    :valid_until "2027-01-01T00:00:00Z"})
+              (signed 4)))))))

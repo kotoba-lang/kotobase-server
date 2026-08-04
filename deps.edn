@@ -40,7 +40,7 @@
          :git/sha "52186628735b396ce35ba598113f1f0df89caad1"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
-         :git/sha "6ab16b54f0804575b5b8d8d264b9ae20c9699227"}
+         :git/sha "97d44a184eb4eea5a0cca737d3c9771fde4b73ec"}
         ;; src/kotobase/server/storage.cljc (landed via #13's untracked-WIP
         ;; cleanup, 2026-07-26) requires kotobase.storage.core, but nothing
         ;; declared this dependency -- main's own CI has been red since that
