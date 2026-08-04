@@ -58,7 +58,9 @@
     ;; (`{:rows [[\"e1\" \"30\"]]}`, not `[[\"e1\" \"\\\"30\\\"\"]]`), so one
     ;; level comes back off here. Measured: without it every projected
     ;; literal came back one quoting level too deep.
-    :else (edn/read-string (:value term))))
+    ;; …when it IS one. An aggregate's result is a real value already
+    ;; (`COUNT` answers the number 2), and read-string on a number throws.
+    :else (let [v (:value term)] (if (string? v) (edn/read-string v) v))))
 
 (defn- coerce-literal
   "A query literal -> the form the datom plane stores.
