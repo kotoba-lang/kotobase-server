@@ -910,7 +910,7 @@
                                      (done)))))))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
-(deftest sparql-basic-subset-compiles-to-the-same-rows-as-datalog
+(deftest sparql-answers-the-same-rows-as-datalog
   (let [store (mem-store)
         tx (fn [] (h/handle store "transact"
                             {:graph "gs" :tx_edn "[{:db/id \"e1\" :sp/name \"alice\" :sp/age 30} {:db/id \"e2\" :sp/name \"bob\"}]"}
@@ -933,10 +933,14 @@
              (is (:ok r))
              (is (= [["e1" "30"]] (:rows r)) "SELECT * binds all vars; numbers stored as strings")))
          (fn []
+           ;; The retired subset refused a WHERE whose only content is an
+           ;; OPTIONAL. That is legal SPARQL and it binds ?e perfectly well,
+           ;; so the surface answers it now — the one deliberate divergence
+           ;; of the swap (ADR-2608039970; recorded in
+           ;; sparql_snapshot_test's `snapshot` too).
            (let [r (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")]
-             (is (false? (:ok r)))
-             (is (= "UnsupportedSparql" (:error r)))
-             (is (re-find #"SELECT" (:message r)) "error carries the supported grammar")))
+             (is (:ok r))
+             (is (= #{["e1"] ["e2"]} (set (:rows r))))))
          (fn []
            (let [r (sparql "SELECT ?x WHERE { ?e <:sp/name> ?n }")]
              (is (false? (:ok r)) "unbound SELECT var rejected")))])
@@ -958,8 +962,11 @@
                       (is (= [["e1" "30"]] (:rows r)))
                       (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")))
              (.then (fn [r]
-                      (is (false? (:ok r)))
-                      (is (= "UnsupportedSparql" (:error r)))
+                      ;; see the :clj branch — the swap's one deliberate
+                      ;; divergence: an OPTIONAL-only WHERE is legal and is
+                      ;; answered now instead of refused.
+                      (is (:ok r))
+                      (is (= #{["e1"] ["e2"]} (set (:rows r))))
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
