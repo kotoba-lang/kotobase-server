@@ -21,18 +21,18 @@
     protocol repo's own scheme is `urn:kotobase:`. Reconciled upstream
     (org-w3-sparql-protocol#8) — a bare `<:attr>` is shorthand now, so one
     attribute has one term whichever spelling was used.
-  - **Value representation.** Rows carry `v_edn`, so a literal in a row is
-    the STORED string (`30` -> `\"30\"`, `\"alice\"` -> the five characters
-    `\"alice\"` with its quotes). The old subset pre-coerces query literals
-    to the same form. Row projection here therefore returns `v_edn`
-    unchanged — that is what `{:rows [[\"e1\" \"30\"]]}` has always meant.
+  - **Value representation.** `pattern-source` decodes `v_edn` one level, so
+    a quad's object is the value the write path STORED — and the write path
+    stringifies, so `:sp/age 30` is the string `\"30\"`. Query literals are
+    coerced with `str` to meet it, which is the same pre-coercion the old
+    subset does at compile time, and projection returns the value as-is —
+    that is what `{:rows [[\"e1\" \"30\"]]}` has always meant.
   - **`visible?` shape.** `pattern-source` takes the ROW-shaped predicate
     (`{:e :a :v_edn :added}`) that `hot-datoms` forwards; `source->quads`
     takes the `{:s :p :o}` one. Filtering happens once, at the row level,
     which is why `(constantly true)` is passed to the second — the rows a
     viewer may not see never became quads."
-  (:require #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])
-            [kotobase.protocols.sparql.parser :as parser]
+  (:require [kotobase.protocols.sparql.parser :as parser]
             [kotobase.protocols.sparql.quads :as quads]
             [kotobase.server.pattern-source :as ps]
             [sparql.core :as sparql]))
@@ -58,9 +58,10 @@
     ;; (`{:rows [[\"e1\" \"30\"]]}`, not `[[\"e1\" \"\\\"30\\\"\"]]`), so one
     ;; level comes back off here. Measured: without it every projected
     ;; literal came back one quoting level too deep.
-    ;; …when it IS one. An aggregate's result is a real value already
-    ;; (`COUNT` answers the number 2), and read-string on a number throws.
-    :else (let [v (:value term)] (if (string? v) (edn/read-string v) v))))
+    ;; No decode: `pattern-source` already handed back stored VALUES, and an
+    ;; aggregate's result is a real value too. This used to read-string here,
+    ;; back when quads carried `v_edn`.
+    :else (:value term)))
 
 (defn- coerce-literal
   "A query literal -> the form the datom plane stores.
@@ -84,7 +85,7 @@
     ;; `:sp/age 30` is stored as the string \"30\", whose `v_edn` is
     ;; `\"\\\"30\\\"\"`. Encoding the number directly gives `\"30\"` and matches
     ;; nothing — measured on `{ ?e <:sp/age> 30 }`.
-    (assoc t :value (pr-str (str (:value t))))
+    (assoc t :value (str (:value t)))
     t))
 
 (defn- coerce-algebra

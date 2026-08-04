@@ -7,7 +7,8 @@
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [datom.source :as src]
             [kotobase.server.handler :as h]
-            [kotobase.server.pattern-source :as ps]))
+            [kotobase.server.pattern-source :as ps]
+            #?(:clj [clojure.edn] :cljs [cljs.reader])))
 
 (defn- passthrough [x] #?(:clj x :cljs (js/Promise.resolve x)))
 
@@ -38,8 +39,16 @@
        " {:db/id \"e2\" :name \"Bob\" :role \"user\"}"
        " {:db/id \"e3\" :name \"Carol\" :role \"admin\"}]"))
 
-(defn- rows->quads [rows]
-  (into #{} (map (fn [{:keys [e a v_edn]}] {:s e :p a :o v_edn})) rows))
+(defn- rows->quads
+  "`do-datoms` rows in the shape the SOURCE reports them: `v_edn` decoded one
+  level, because a source hands back stored VALUES and a row reports their
+  encoding. The two are the same datoms in two representations, and this is
+  the conversion between them."
+  [rows]
+  (into #{} (map (fn [{:keys [e a v_edn]}]
+                   {:s e :p a :o #?(:clj (clojure.edn/read-string v_edn)
+                                    :cljs (cljs.reader/read-string v_edn))}))
+        rows))
 
 (deftest a-full-scan-source-answers-what-do-datoms-answers
   (testing "the equivalence the switch depends on"
@@ -78,15 +87,14 @@
                     (fn [resp] (is (:ok resp)))))
       (fn []
         (then* (ps/source-for store ((:head-get store) "g3")
-                              [[nil ":role" "\"admin\""]])
+                              [[nil ":role" "admin"]])
                (fn [source]
                  (is (= #{"e1" "e3"}
                         (into #{} (map :s)
-                              (src/scan-set source [nil ":role" "\"admin\""])))
+                              (src/scan-set source [nil ":role" "admin"])))
                      "the object is filtered at scan time against the STORED
-                      form the rows carry; the read itself is the predicate's
-                      range (see object-unbound for why the value component is
-                      not pushed yet)"))))])))
+                      VALUE (\"admin\", not its encoding); the read itself is
+                      the predicate's range — see object-unbound"))))])))
 
 (deftest a-graph-with-nothing-written-is-an-empty-source
   (testing "not an error — the same posture do-datoms takes"
