@@ -2,45 +2,23 @@
  ;; kotobase-server -- platform-independent XRPC handler + async/sync storage
  ;; bridge for a kotobase-peer-backed worker. No deploy surface, no
  ;; Cloudflare/R2/B2-specific code -- see README.md.
- ;; kotobase-peer pin: feature-frozen engine facade after the capability
- ;; split. Projection, federation, and maintenance behavior now lives in
- ;; their dedicated repositories; compatibility namespaces remain here.
+ ;; kotobase-peer pin: picks up arrangement's truncated-CBOR-input fix
+ ;; (kotobase-peer#14, propagated from io-ipld/org-ietf-cbor) -- this
+ ;; handler decodes untrusted bytes via kotobase-peer's engine calls
+ ;; (hot-datoms/commit!/fold!), same vulnerable decode path.
  ;; kotobase-client pin: picks up kotobase.cid/did-key->ed25519-pub's
  ;; fail-closed fix (returns nil, not a throw, on malformed base58) --
  ;; kotobase.server.ipns requires kotobase.ipns (kotobase-client), whose
  ;; verify-head calls did-key->ed25519-pub directly to resolve the
  ;; signer's pubkey for every IPNS record signature check.
- :deps {;; datom-source is the IPatternSource contract kotobase.server.
-        ;; pattern-source implements (superproject ADR-2608039970). Zero deps
-        ;; of its own; kotobase-client carries the shared index plan.
-        io.github.kotoba-lang/datom-source
-        {:git/url "https://github.com/kotoba-lang/datom-source.git"
-         :git/sha "b42f6e6ff942c7f8a2856f8142ebffc13aa11098"}
-        ;; PIN ALIGNMENT, and it is load-bearing. org-w3-sparql-protocol pulls
-        ;; kotobase-query -> arrangement 9e90426, which tools.deps selects over
-        ;; the f4e3118 kotobase-peer depends on (:newer-version wins silently).
-        ;; Measured 2026-08-04: taking the surface WITHOUT these three pins
-        ;; turned 78/332 green into 16 failures in fold and hot-db caching —
-        ;; the engine's own libraries swapped out from under it by a query
-        ;; surface's transitive tree. Top-level deps win, so they are stated.
-        io.github.kotoba-lang/arrangement
-        {:git/url "https://github.com/kotoba-lang/arrangement.git"
-         :git/sha "83b3fe95cca8c318d20bab09276afe43a13890d0"}
-        io.github.kotoba-lang/io-ipld
-        {:git/url "https://github.com/kotoba-lang/io-ipld.git"
-         :git/sha "e08dc3b2ab705be292e388cd1ad136381544a041"}
-        io.github.kotoba-lang/prolly-tree
-        {:git/url "https://github.com/kotoba-lang/prolly-tree.git"
-         :git/sha "e91eefcd21a4c5302868e519659433385a020961"}
-        io.github.kotoba-lang/org-w3-sparql-protocol
-        {:git/url "https://github.com/kotoba-lang/org-w3-sparql-protocol.git"
-         :git/sha "49c59208442753458daf1dacbf15e1ba6539507f"}
+ :deps {io.github.kotoba-lang/kotobase-storage
+        {:local/root "../kotobase-storage"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "52186628735b396ce35ba598113f1f0df89caad1"}
+         :git/sha "afe47e0990d1bc7ccfb53389d88cd0d6fb8068ac"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
-         :git/sha "97d44a184eb4eea5a0cca737d3c9771fde4b73ec"}
+         :git/sha "a1799ffaa20557ba9b3eb956d4978c865734aa49"}
         ;; src/kotobase/server/storage.cljc (landed via #13's untracked-WIP
         ;; cleanup, 2026-07-26) requires kotobase.storage.core, but nothing
         ;; declared this dependency -- main's own CI has been red since that
@@ -53,7 +31,7 @@
  :aliases
  {:cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "2.28.20"}}}
   :test-node
-  {:extra-paths ["test"]
+  {:extra-paths ["test" "../kotobase-peer/src"]
    :extra-deps {thheller/shadow-cljs {:mvn/version "2.28.20"}}}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
