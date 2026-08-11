@@ -36,6 +36,7 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
+            [clojure.set :as set]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [kotobase.server.materialized :as materialized]
@@ -112,6 +113,150 @@
               (throw (ex-info "kotobase: unrecognized tx_edn item" {:item item}))))
           (edn/read-string tx-edn)))
 
+(def ^:private schema-properties
+  {:db/valueType "db/valueType"
+   :db/cardinality "db/cardinality"
+   :db/unique "db/unique"
+   :db/doc "db/doc"
+   :db/tupleTypes "db/tupleTypes"})
+
+(defn- schema-value
+  "Official Datomic schema keyword -> kotobase-peer's compact schema value."
+  [value]
+  (cond
+    (vector? value) (mapv schema-value value)
+    (keyword? value) (keyword (name value))
+    :else value))
+
+(defn- schema-wire-value [value]
+  (cond
+    (vector? value) (str/join "," (map schema-wire-value value))
+    (keyword? value) (name value)
+    :else (str value)))
+
+(defn- schema-declaration? [item]
+  (and (map? item) (:db/ident item)
+       (some #(contains? item %) (keys schema-properties))))
+
+(defn- inline-schema [items]
+  (into {}
+        (keep (fn [item]
+                (when (schema-declaration? item)
+                  [(str (:db/ident item))
+                   (into {}
+                         (keep (fn [[official _wire]]
+                                 (when (contains? item official)
+                                   [official (schema-value (get item official))])))
+                         schema-properties)])))
+        items))
+
+(defn- entity-map-operations [item]
+  (let [entity (:db/id item)]
+    (when-not (some? entity)
+      (throw (ex-info "Datomic entity map requires :db/id" {:item item})))
+    (mapv (fn [[attribute value]] [:db/add entity attribute value])
+          (dissoc item :db/id))))
+
+(defn- schema-operations [item]
+  (let [attribute (:db/ident item)]
+    (into [[:db/add (str attribute) :db/ident attribute]]
+          (keep (fn [[official wire]]
+                  (when (contains? item official)
+                    {:s (str attribute) :p wire
+                     :o (schema-wire-value (get item official))})))
+          schema-properties)))
+
+(defn- current-values [db entity attribute]
+  (get-in db [:spo (str entity) (str attribute)] #{}))
+
+(defn- stored-value [value]
+  (if (ipld/link? value) value (str value)))
+
+(defn- expand-hosted-builtins
+  "Expand the public built-in transaction functions against db-before.
+  Unknown function identifiers fail loudly; arbitrary persisted Clojure is
+  never evaluated in a Worker."
+  [db items]
+  (mapcat
+   (fn [item]
+     (cond
+       (schema-declaration? item) (schema-operations item)
+       (map? item) (entity-map-operations item)
+
+       (and (sequential? item) (= :db.fn/cas (first item)) (= 5 (count item)))
+       (let [[_ entity attribute old-value new-value] item
+             actual (current-values db entity attribute)
+             expected (stored-value old-value)]
+         (when-not (= actual #{expected})
+           (throw (ex-info "Compare-and-swap failed"
+                           {:type :kotobase.datomic/cas-failed
+                            :entity entity :attribute attribute
+                            :expected old-value :actual actual})))
+         [[:db/retract entity attribute old-value]
+          [:db/add entity attribute new-value]])
+
+       (and (sequential? item) (= :db.fn/retractAttribute (first item))
+            (= 3 (count item)))
+       (let [[_ entity attribute] item]
+         (mapv (fn [value] [:db/retract entity attribute value])
+               (current-values db entity attribute)))
+
+       (and (sequential? item) (= :db.fn/retractEntity (first item))
+            (= 2 (count item)))
+       [[:db/retractEntity (second item)]]
+
+       (and (sequential? item) (keyword? (first item))
+            (not (contains? #{:db/add :db/retract :db/retractEntity}
+                            (first item))))
+       (throw (ex-info "Transaction function is not registered on this host"
+                       {:type :kotobase.datomic/unknown-transaction-function
+                        :function (first item)}))
+
+       :else [item]))
+   items))
+
+(defn- db-quads [db]
+  (into #{}
+        (for [[entity attrs] (:spo db)
+              [attribute values] attrs
+              value values]
+          {:s entity :p attribute :o value})))
+
+(defn prepare-hosted-transaction
+  "Validate and expand Client API tx data against one immutable db-before.
+  Returns only effective persistence deltas, including cardinality-one
+  retractions. This function is pure; the caller commits the result only after
+  it returns successfully."
+  [db tx-edn]
+  (let [items (edn/read-string tx-edn)
+        schema (inline-schema items)
+        enforce-schema? (or (seq schema) (seq (eng/schema-of db)))
+        operations (vec (expand-hosted-builtins db items))
+        db-after
+        (reduce
+         (fn [current operation]
+           (let [op (when (sequential? operation) (first operation))
+                 ident-op? (and (= :db/add op) (= :db/ident (nth operation 2 nil)))]
+             (cond
+               (contains? #{:db/retract :db/retractEntity} op)
+               (eng/transact current [operation])
+
+               ident-op?
+               (eng/transact current [operation])
+
+               enforce-schema?
+               (eng/transact-with-schema current [operation] schema)
+
+               :else
+               (eng/transact current [operation]))))
+         db operations)
+        before (db-quads db)
+        after (db-quads db-after)]
+    (vec
+     (concat
+      (map #(assoc % :op :retract) (sort-by (juxt :s :p #(pr-str (:o %))) (set/difference before after)))
+      (sort-by (juxt :s :p #(pr-str (:o %))) (set/difference after before))))))
+
 ;; ── read/write against the graph's persisted chain (ADR-2607032430 D1) ──────
 ;; The chain's head IS the unit of state now (snapshot + pending novelty), not
 ;; just its folded snapshot -- every read goes through `eng/hot-datoms` so it
@@ -180,7 +325,7 @@
                               (policy/visible-for-mode policy caps owned
                                                        (:security-mode store))))))))))))
 
-(declare db-for-body)
+(declare db-for-body hot-db)
 
 (defn do-datoms
   "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
@@ -236,10 +381,13 @@
   AFTER this fn returns, retrying the WHOLE call on a lost race). See
   `kotoba-lang/kotobase-cljc-worker`'s `worker.cljc` (`run-write-attempt`/
   `run-write`) for the reference orchestration this was extracted from."
-  [store {:keys [graph tx_edn]} auth]
+  [store {:keys [graph tx_edn enforce_schema]} auth]
   (let [get-fn (:get-fn store)
         prev-chain ((:head-get store) graph)
-        quads (vec (tx-edn->quads tx_edn))
+        prepared-quads (if enforce_schema
+                         (then* (hot-db store prev-chain)
+                                #(prepare-hosted-transaction % tx_edn))
+                         (vec (tx-edn->quads tx_edn)))
         context (if (map? auth)
                   auth
                   {:did auth :effective-caps #{policy/transact-capability
@@ -250,16 +398,18 @@
                                       (constantly true) (:blind-fn store) (:decrypt-fn store)
                                       (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
-    (then* policy-rows
-           (fn [rows]
-             (policy/assert-write-authorized!
-              (policy/policy-of rows) context quads (:security-mode store))
-             (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
-                    (fn [chain]
-                      ((:head-put! store) graph chain)
-                      {:ok true :graph graph :commit chain :previous_commit prev-chain
-                       :datom_count (count quads)
-                       :novelty_size (eng/novelty-size get-fn chain)}))))))
+    (then* prepared-quads
+           (fn [quads]
+             (then* policy-rows
+                    (fn [rows]
+                      (policy/assert-write-authorized!
+                       (policy/policy-of rows) context quads (:security-mode store))
+                      (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
+                             (fn [chain]
+                               ((:head-put! store) graph chain)
+                               {:ok true :graph graph :commit chain :previous_commit prev-chain
+                                :datom_count (count quads)
+                                :novelty_size (eng/novelty-size get-fn chain)}))))))))
 
 ;; ── kg.ingest / kg.ingest_batch (ai.gftd.apps.kotobase.kg.*, additive) ───────
 ;; A SEPARATE NSID family from datomic.* above -- extracted here (2026-07-18)
