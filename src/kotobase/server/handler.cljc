@@ -180,6 +180,8 @@
                               (policy/visible-for-mode policy caps owned
                                                        (:security-mode store))))))))))))
 
+(declare db-for-body)
+
 (defn do-datoms
   "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
   merge, range-pruned on the snapshot side; never a whole-graph rehydrate).
@@ -203,14 +205,20 @@
   docstring reports from gftdcojp/app-aozora#78 (5130-leaf snapshot: 300s+
   CPU via the trampoline vs 806ms via the async path). Stores that supply
   no `:async-get-fn` keep exactly today's behavior."
-  [store {:keys [graph index components_edn limit]}]
+  [store {:keys [graph index components_edn limit] :as body}]
   (let [chain ((:head-get store) graph)]
-    (then* (eng/hot-datoms (:get-fn store) chain
-                           {:index (or (index-kw index) :eavt)
-                            :components (vec components_edn)
-                            :limit limit}
-                           (visible-of store) (:blind-fn store) (:decrypt-fn store)
-                           (:async-get-fn store))
+    (then* (if (:with_edn body)
+             (then* (db-for-body store chain body)
+                    #(eng/datoms % {:index (or (index-kw index) :eavt)
+                                    :components (vec components_edn)
+                                    :limit limit}
+                                 (visible-of store)))
+             (eng/hot-datoms (:get-fn store) chain
+                             {:index (or (index-kw index) :eavt)
+                              :components (vec components_edn)
+                              :limit limit}
+                             (visible-of store) (:blind-fn store) (:decrypt-fn store)
+                             (:async-get-fn store)))
            (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
 (defn do-transact
@@ -473,6 +481,35 @@
                (when (and cache-put! chain) (cache-put! chain db))
                db)))))
 
+(defn- db-for-body
+  "Hydrate the durable basis and, when `with_edn` is present, apply that
+  transaction data only to the request-local immutable db.  `with_edn` is the
+  portable representation of a Client API db-after value: it can be sent back
+  by q/pull/datoms without ever advancing the graph head."
+  [store chain {:keys [with_edn]}]
+  (then* (hot-db store chain)
+         (fn [db]
+           (if (some? with_edn)
+             (:db-after (eng/with db (vec (tx-edn->quads with_edn))))
+             db))))
+
+(defn do-with
+  "`datomic.with` -- produce a portable speculative db token.  The result
+  deliberately contains no engine-internal db maps; callers feed `with_edn`
+  back to read methods to address db-after.  No block or head write occurs."
+  [store {:keys [graph tx_edn] :as body}]
+  (let [chain ((:head-get store) graph)
+        entries (when chain (eng/chain (:get-fn store) chain))]
+    (then* (db-for-body store chain (dissoc body :with_edn))
+           (fn [db]
+             (let [quads (vec (tx-edn->quads tx_edn))
+                   report (eng/with db quads)]
+               {:ok true
+                :graph graph
+                :basis_t (:seq (last entries))
+                :with_edn tx_edn
+                :tx_data (mapv #(select-keys % [:s :p :o :op]) (:tx-data report))})))))
+
 ;; ── query-literal normalization (wire symmetry with tx-edn->quads) ──────────
 ;; The write path stringifies EVERY non-Link datom position before it reaches
 ;; the engine (`tx-edn->quads` above: `(str a)` / `(str v)` -- a transacted
@@ -572,10 +609,10 @@
   Datomic way (keyword attributes, keyword/number value literals) matches
   the stringified representation the write path actually stored -- see
   the normalization section comment above for the live bug this fixes."
-  [store {:keys [graph query_edn inputs_edn]}]
+  [store {:keys [graph query_edn inputs_edn] :as body}]
   (let [chain ((:head-get store) graph)
         pat (normalize-query-literals (edn/read-string query_edn))]
-    (then* (hot-db store chain)
+    (then* (db-for-body store chain body)
            (fn [db]
              (let [inputs (when inputs_edn
                             (mapv wire-literal (edn/read-string inputs_edn)))
@@ -649,17 +686,20 @@
   once -- a pattern can nest/wildcard/reverse-nav arbitrarily, so there is
   no single flat per-leaf v_edn encoding that composes across that the
   way there is for a flat attr map). body: {:graph :entity :pattern_edn}."
-  [store {:keys [graph entity pattern_edn]}]
+  [store {:keys [graph entity pattern_edn] :as body}]
   (if pattern_edn
     (let [chain ((:head-get store) graph)
           pattern (edn/read-string pattern_edn)]
-      (then* (hot-db store chain)
+      (then* (db-for-body store chain body)
              (fn [db] {:ok true :graph graph :entity entity
                        :result_edn (pr-str (materialized/pull db entity pattern
                                                             (visible-of store)))})))
     (let [chain ((:head-get store) graph)]
-      (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                             (visible-of store) (:blind-fn store) (:decrypt-fn store))
+      (then* (if (:with_edn body)
+               (then* (db-for-body store chain body)
+                      #(eng/datoms % {:index :eavt :components [entity]} (visible-of store)))
+               (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                               (visible-of store) (:blind-fn store) (:decrypt-fn store)))
              (fn [rows]
                {:ok true :graph graph :entity entity
                 :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))
@@ -669,10 +709,10 @@
   entities. body: {:graph :entities :pattern_edn} -- `:entities` a vector
   of entity ids, `:pattern_edn` required (unlike `do-pull`, pullMany has
   no flat-attrs legacy shape to fall back to)."
-  [store {:keys [graph entities pattern_edn]}]
+  [store {:keys [graph entities pattern_edn] :as body}]
   (let [chain ((:head-get store) graph)
         pattern (edn/read-string pattern_edn)]
-    (then* (hot-db store chain)
+    (then* (db-for-body store chain body)
            (fn [db]
              {:ok true :graph graph
               :results_edn (mapv pr-str (materialized/pull-many db entities pattern
@@ -700,9 +740,9 @@
   equivalent eager form). Returns the WHOLE entity map pr-str'd
   (`:entity_edn`), same reasoning as `do-pull`'s pattern path: raw
   decoded values, not per-attribute wire strings. body: {:graph :entity}."
-  [store {:keys [graph entity]}]
+  [store {:keys [graph entity] :as body}]
   (let [chain ((:head-get store) graph)]
-    (then* (hot-db store chain)
+    (then* (db-for-body store chain body)
            (fn [db] {:ok true :graph graph :entity entity
                      :entity_edn (pr-str (materialized/entity db entity (visible-of store)))}))))
 
@@ -714,9 +754,9 @@
   way real Datomic's `entid` does). body: {:graph :ident_edn} --
   `:ident_edn` is an EDN string (so the caller can send either a plain
   string id or a keyword ident through the same field, unambiguously)."
-  [store {:keys [graph ident_edn]}]
+  [store {:keys [graph ident_edn] :as body}]
   (let [chain ((:head-get store) graph)]
-    (then* (hot-db store chain)
+    (then* (db-for-body store chain body)
            (fn [db] {:ok true :graph graph
                      :entity_id (materialized/entid db (edn/read-string ident_edn))}))))
 
@@ -726,9 +766,9 @@
   `:ident_edn` in the response is pr-str'd (nil pr-str's to the string
   \"nil\", NOT omitted -- a caller distinguishes \"no ident\" from a
   malformed response by the field always being present)."
-  [store {:keys [graph entity]}]
+  [store {:keys [graph entity] :as body}]
   (let [chain ((:head-get store) graph)]
-    (then* (hot-db store chain)
+    (then* (db-for-body store chain body)
            (fn [db] {:ok true :graph graph :entity entity
                      :ident_edn (pr-str (materialized/ident db entity))}))))
 
@@ -1155,6 +1195,7 @@
               (case method
                 "datoms"      (do-datoms store body)
                 "transact"    (do-transact store body auth)
+                "with"        (do-with store body)
                 "q"           (do-q store body)
                 "sparql"      (do-sparql store body)
                 "cypher"      (do-cypher store body)
@@ -1188,7 +1229,7 @@
       ;; commit metadata and id mappings, no datom content) skip the extra
       ;; narrow read entirely.
       (let [viewer (when (map? auth) auth)
-            row-methods #{"datoms" "q" "sparql" "cypher" "pull" "pullMany" "indexPull"
+            row-methods #{"datoms" "q" "with" "sparql" "cypher" "pull" "pullMany" "indexPull"
                           "entity" "asOf" "since" "history"
                           "seekDatoms" "indexRange" "view"}
             metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"

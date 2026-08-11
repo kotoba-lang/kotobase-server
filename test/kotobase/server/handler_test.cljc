@@ -397,6 +397,39 @@
                Datalog engine) instead of being silently mistreated as an
                empty/malformed triple pattern"))])))
 
+(deftest with-produces-a-non-durable-db-after-for-follow-on-reads
+  (let [store (mem-store)
+        speculative "[[:db/add \"e1\" :name \"Alicia\"]]"
+        query "{:find [?n] :where [[\"e1\" :name ?n]]}"]
+    (run-async
+     [(step store "transact"
+            {:graph "with-g" :tx_edn "[{:db/id \"e1\" :name \"Alice\"}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "basisT" {:graph "with-g"} nil
+            (fn [resp] (is (= 0 (:t resp)))))
+      (step store "with" {:graph "with-g" :tx_edn speculative} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 0 (:basis_t resp)))
+              (is (= speculative (:with_edn resp)))
+              (is (= 1 (count (:tx_data resp))))))
+      (step store "q" {:graph "with-g" :query_edn query :with_edn speculative} nil
+            (fn [resp]
+              (is (= #{["Alice"] ["Alicia"]} (set (:rows resp))))
+              "db-after is addressable by carrying its speculative tx-data"))
+      (step store "datoms" {:graph "with-g" :with_edn speculative} nil
+            (fn [resp]
+              (is (= #{"Alice" "Alicia"}
+                     (set (map #(edn/read-string (:v_edn %)) (:datoms resp)))))))
+      (step store "q" {:graph "with-g" :query_edn query} nil
+            (fn [resp]
+              (is (= #{["Alice"]} (set (:rows resp))))
+              "ordinary reads remain on the durable database"))
+      (step store "basisT" {:graph "with-g"} nil
+            (fn [resp]
+              (is (= 0 (:t resp)) "with never advances the durable head")))])))
+
 ;; ── query-literal normalization (the live "q sees nothing datoms sees"
 ;; bug, confirmed against backend.kotobase.net 2026-07-09): the write path
 ;; stores every non-Link position stringified (tx-edn->quads, `(str v)`),
