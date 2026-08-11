@@ -37,7 +37,7 @@
          :git/sha "49c59208442753458daf1dacbf15e1ba6539507f"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "52186628735b396ce35ba598113f1f0df89caad1"}
+         :git/sha "4926d13e992c7b9c52a44bb7aae672eb80c6c4af"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
          :git/sha "97d44a184eb4eea5a0cca737d3c9771fde4b73ec"}

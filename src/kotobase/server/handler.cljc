@@ -150,12 +150,28 @@
                          schema-properties)])))
         items))
 
-(defn- entity-map-operations [item]
+(defn- schema-property [decl normalized official]
+  (or (get decl normalized)
+      (some-> (get decl official) schema-value name)))
+
+(defn- entity-map-operations [db schema item]
   (let [entity (:db/id item)]
     (when-not (some? entity)
       (throw (ex-info "Datomic entity map requires :db/id" {:item item})))
-    (mapv (fn [[attribute value]] [:db/add entity attribute value])
-          (dissoc item :db/id))))
+    (vec
+     (mapcat
+      (fn [[attribute value]]
+        (let [decl (or (get schema (str attribute))
+                       (get (eng/schema-of db) (str attribute)))
+              cardinality (schema-property decl :cardinality :db/cardinality)
+              value-type (schema-property decl :value-type :db/valueType)
+              values (if (and (= "many" cardinality)
+                              (coll? value)
+                              (not= "tuple" value-type))
+                       value
+                       [value])]
+          (map (fn [v] [:db/add entity attribute v]) values)))
+      (dissoc item :db/id)))))
 
 (defn- schema-operations [item]
   (let [attribute (:db/ident item)]
@@ -176,12 +192,12 @@
   "Expand the public built-in transaction functions against db-before.
   Unknown function identifiers fail loudly; arbitrary persisted Clojure is
   never evaluated in a Worker."
-  [db items]
+  [db schema items]
   (mapcat
    (fn [item]
      (cond
        (schema-declaration? item) (schema-operations item)
-       (map? item) (entity-map-operations item)
+       (map? item) (entity-map-operations db schema item)
 
        (and (sequential? item) (= :db.fn/cas (first item)) (= 5 (count item)))
        (let [[_ entity attribute old-value new-value] item
@@ -231,7 +247,7 @@
   (let [items (edn/read-string tx-edn)
         schema (inline-schema items)
         enforce-schema? (or (seq schema) (seq (eng/schema-of db)))
-        operations (vec (expand-hosted-builtins db items))
+        operations (vec (expand-hosted-builtins db schema items))
         db-after
         (reduce
          (fn [current operation]
