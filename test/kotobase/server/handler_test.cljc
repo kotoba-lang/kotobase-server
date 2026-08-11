@@ -441,7 +441,10 @@
                   :db/unique :db.unique/identity}
                  {:db/id "schema/age" :db/ident :person/age
                   :db/valueType :db.type/long
-                  :db/cardinality :db.cardinality/one}])
+                  :db/cardinality :db.cardinality/one}
+                 {:db/id "schema/tags" :db/ident :person/tags
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/many}])
         basis (atom nil)]
     (run-async
      [(step store "transact" {:graph "schema-g" :tx_edn schema-tx
@@ -449,8 +452,15 @@
             (fn [resp] (is (:ok resp) (pr-str resp))))
       (step store "transact"
             {:graph "schema-g" :enforce_schema true
-             :tx_edn "[{:db/id \"alice\" :person/name \"Alice\" :person/email \"a@example.test\" :person/age 42}]"}
+             :tx_edn "[{:db/id \"alice\" :person/name \"Alice\" :person/email \"a@example.test\" :person/age 42 :person/tags [\"author\" \"admin\"]}]"}
             "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?tag] :where [[\"alice\" :person/tags ?tag]]}"}
+            nil
+            (fn [resp]
+              (is (= #{["author"] ["admin"]} (set (:rows resp)))
+                  "cardinality-many entity-map values expand to individual datoms")))
       (step store "basisT" {:graph "schema-g"} nil
             (fn [resp] (reset! basis (:t resp))))
       (step store "transact"
