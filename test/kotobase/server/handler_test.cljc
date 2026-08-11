@@ -430,6 +430,65 @@
             (fn [resp]
               (is (= 0 (:t resp)) "with never advances the durable head")))])))
 
+(deftest hosted-client-transactions-enforce-schema-and-builtins-atomically
+  (let [store (mem-store)
+        schema-tx
+        (pr-str [{:db/id "schema/name" :db/ident :person/name
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/one}
+                 {:db/id "schema/email" :db/ident :person/email
+                  :db/valueType :db.type/string
+                  :db/unique :db.unique/identity}
+                 {:db/id "schema/age" :db/ident :person/age
+                  :db/valueType :db.type/long
+                  :db/cardinality :db.cardinality/one}])
+        basis (atom nil)]
+    (run-async
+     [(step store "transact" {:graph "schema-g" :tx_edn schema-tx
+                                :enforce_schema true} "did:key:ztest"
+            (fn [resp] (is (:ok resp) (pr-str resp))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"alice\" :person/name \"Alice\" :person/email \"a@example.test\" :person/age 42}]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "basisT" {:graph "schema-g"} nil
+            (fn [resp] (reset! basis (:t resp))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"bob\" :person/email \"a@example.test\"}]"}
+            "did:key:ztest"
+            (fn [resp]
+              (is (false? (:ok resp)))
+              (is (= "InternalError" (:error resp)))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"alice\" :person/age \"forty-two\"}]"}
+            "did:key:ztest"
+            (fn [resp] (is (false? (:ok resp)))))
+      (step store "basisT" {:graph "schema-g"} nil
+            (fn [resp]
+              (is (= @basis (:t resp))
+                  "failed schema transactions never advance the head")))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[[:db.fn/cas \"alice\" :person/name \"Alice\" \"Alicia\"]]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?n] :where [[\"alice\" :person/name ?n]]}"}
+            nil
+            (fn [resp]
+              (is (= #{["Alicia"]} (set (:rows resp)))
+                  "CAS plus cardinality-one leaves exactly the replacement")))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[[:db.fn/retractAttribute \"alice\" :person/name]]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?n] :where [[\"alice\" :person/name ?n]]}"}
+            nil (fn [resp] (is (empty? (:rows resp)))))])))
+
 ;; ── query-literal normalization (the live "q sees nothing datoms sees"
 ;; bug, confirmed against backend.kotobase.net 2026-07-09): the write path
 ;; stores every non-Link position stringified (tx-edn->quads, `(str v)`),
