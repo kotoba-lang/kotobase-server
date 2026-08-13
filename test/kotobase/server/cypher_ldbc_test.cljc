@@ -24,7 +24,11 @@
    ["post-10"    ":label" "Post"]    ["post-10" ":id" "10"] ["post-10" ":content" "root"]
    ["comment-11" ":label" "Comment"] ["comment-11" ":id" "11"] ["comment-11" ":imageFile" "x.jpg"]
    ["comment-12" ":label" "Comment"] ["comment-12" ":id" "12"]
-   ["comment-11" ":replyOf" "post-10"] ["comment-12" ":replyOf" "comment-11"]])
+   ["comment-11" ":replyOf" "post-10"] ["comment-12" ":replyOf" "comment-11"]
+   ;; forum-40 contains post-10 and is moderated by person-2 -- the shape LDBC
+   ;; Interactive Short 6 walks to from a comment.
+   ["forum-40" ":label" "Forum"] ["forum-40" ":id" "40"] ["forum-40" ":title" "Forum A"]
+   ["forum-40" ":containerOf" "post-10"] ["forum-40" ":hasModerator" "person-2"]])
 
 ;; Minimal nested-loop BGP evaluator: enough to execute a compiled query, small
 ;; enough to be obviously correct.
@@ -186,3 +190,30 @@
 (deftest an-unknown-function-is-rejected-at-parse-time
   (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
                (cypher/parse "MATCH (n:Person {id: \"1\"}) RETURN upper(n.firstName)" {}))))
+
+;; ---------------------------------------------------------------- IS6 shape
+
+(deftest a-path-that-connects-two-components-is-not-a-cross-product
+  ;; LDBC Interactive Short 6's shape: the start node is pinned by id, and the
+  ;; ONLY thing linking it to the forum/moderator half of the pattern is a
+  ;; variable-length path. Solving the whole BGP before expanding the path makes
+  ;; those halves a cross product.
+  ;;
+  ;; Measured 2026-08-13 on LDBC SF-0.1 before this was interleaved: IS6 returned
+  ;; 135,701 rows for a query whose correct answer is one row, and spent 8.2 s
+  ;; doing it. A wrong answer with a plausible latency next to it is worse than
+  ;; a slow one.
+  (let [q (str "MATCH (c:Comment {id: \"12\"})-[:replyOf*0..]->(m:Post), "
+               "(f:Forum)-[:containerOf]->(m) "
+               "RETURN m.id, f.id")]
+    (is (= 1 (count (:rows (run q))))
+        "one comment, one root post, one forum -- one row")
+    (is (= #{["10" "40"]} (rows-of q)))))
+
+(deftest a-genuinely-disconnected-pattern-is-still-a-cross-product
+  ;; The interleaving must not silently drop rows from a query that really is
+  ;; disconnected: 3 persons x 2 messages is 6, and that is the right answer.
+  (let [rows (:rows (run "MATCH (p:Person), (m:Comment) RETURN p.id, m.id"))]
+    (is (= 3 (count (distinct (map first rows)))))
+    (is (= 2 (count (distinct (map second rows)))))
+    (is (= 6 (count rows)))))
