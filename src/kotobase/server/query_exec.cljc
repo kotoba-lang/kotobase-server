@@ -188,8 +188,47 @@
           idx (group-by #(mapv % shared) right)]
       (vec (mapcat (fn [l] (map #(merge l %) (get idx (mapv l shared)))) left)))))
 
+(def ^:private component-pushdown-limit
+  "Above this many distinct shared-variable tuples, push nothing and materialise
+  the component once. One selective query per tuple beats one broad scan only
+  while the tuples are few; past that the broad scan is read once and the keyed
+  form reads most of it in pieces -- the same trade the engine makes for its own
+  hash join, and the same reason it defaults to the keyed path when it has no
+  estimate."
+  512)
+
+(defn- solve-component
+  "Rows for one BGP component, with the bindings already in hand substituted in
+  where they fit.
+
+  Without this the component is solved against the whole dataset and only then
+  joined. Measured 2026-08-13 on LDBC SF-0.1: Interactive Short 6 spent its time
+  materialising every forum-contains-post-moderated-by-person row in the
+  dataset, to keep the one whose post the path had already identified."
+  [engine-query bind-maps {:keys [clauses]}]
+  (let [vars (pattern-vars clauses)
+        solve-all (fn [] (rows->maps vars (engine-query {:find vars :where clauses})))]
+    (if (empty? bind-maps)
+      (solve-all)
+      (let [bound (set (keys (first bind-maps)))
+            shared (vec (clojure.set/intersection bound (set vars)))
+            tuples (when (seq shared) (distinct (map #(mapv % shared) bind-maps)))]
+        (if (or (empty? shared) (> (count tuples) component-pushdown-limit))
+          (solve-all)
+          (vec (mapcat (fn [tuple]
+                         (let [sub (zipmap shared tuple)
+                               clauses' (mapv (fn [c] (mapv #(get sub % %) c)) clauses)
+                               vars' (pattern-vars clauses')]
+                           ;; The substituted variables are gone from the
+                           ;; clauses, so they are gone from the rows too --
+                           ;; merge them back or the join loses them.
+                           (map #(merge sub %)
+                                (rows->maps vars' (engine-query {:find vars' :where clauses'})))))
+                       tuples)))))))
+
 (defn- solve-base
-  "Solve the BGP and expand the paths, INTERLEAVED.
+  "Solve the BGP and expand the paths, INTERLEAVED, pushing bindings into each
+  component as it is taken.
 
   The previous order solved the whole BGP first and then expanded paths. When a
   path is the only thing connecting two parts of the pattern -- LDBC Interactive
@@ -199,14 +238,13 @@
   Measured 2026-08-13 on LDBC SF-0.1: IS 6 returned 135,701 rows for a query
   whose correct answer is one row, and took 8.2 s to do it.
 
-  Components are solved independently, then joined only once something binds a
-  variable they share: a component is taken when it shares a variable with what
-  is already bound, and a path is expanded as soon as its `:from` is bound."
+  Components are solved in an order that keeps them connected: a component is
+  taken when it shares a variable with what is already bound, and a path is
+  expanded as soon as its `:from` is bound."
   [engine-query where paths adjacency]
   (let [components (connected-components where)]
     (loop [bind-maps [] pending (vec components) remaining-paths (vec paths)]
       (let [bound (if (seq bind-maps) (set (keys (first bind-maps))) #{})
-            ;; A path whose start is bound prunes; expand it before joining more.
             ready-path (first (filter #(contains? bound (:from %)) remaining-paths))]
         (cond
           ready-path
@@ -214,15 +252,12 @@
                  (vec (remove #{ready-path} remaining-paths)))
 
           (empty? pending)
-          ;; Any path left has an unbound start: nothing constrains it, so the
-          ;; general expansion is the honest answer rather than a guess.
           (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps remaining-paths)
 
           :else
           (let [connected (filter #(seq (clojure.set/intersection bound (:vars %))) pending)
                 pick (first (or (seq connected) (seq pending)))
-                vars (pattern-vars (:clauses pick))
-                rows (rows->maps vars (engine-query {:find vars :where (:clauses pick)}))]
+                rows (solve-component engine-query bind-maps pick)]
             (recur (natural-join bind-maps rows)
                    (vec (remove #{pick} pending))
                    remaining-paths)))))))
