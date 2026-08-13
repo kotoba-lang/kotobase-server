@@ -31,7 +31,8 @@
   (multi-clause or-join branch support not relied on here), ORDER BY
   (engine returns a set). The pushable path and the post-pass path are
   asserted to agree by the same test suite (identical results either way)."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [clojure.set]))
 
 (declare execute-post-pass execute-pushed)
 
@@ -160,6 +161,71 @@
               (seq bind-maps)
               (contains? (first bind-maps) s)
               (not (contains? (first bind-maps) o))))))
+
+(defn- clause-vars [[s _ o]] (set (filter symbol? [s o])))
+
+(defn- connected-components
+  "Split a BGP into groups of clauses that share variables, transitively."
+  [clauses]
+  (reduce (fn [groups clause]
+            (let [vs (clause-vars clause)
+                  [touching separate] ((juxt filter remove)
+                                       (fn [g] (seq (clojure.set/intersection vs (:vars g)))) groups)]
+              (conj (vec separate)
+                    {:vars (into vs (mapcat :vars touching))
+                     :clauses (into [clause] (mapcat :clauses touching))})))
+          [] clauses))
+
+(defn- natural-join
+  "Hash join two bind-map seqs on the variables they share. With no shared
+  variable this is a cross product, which is the correct answer for a genuinely
+  disconnected query and a disaster for one that is only disconnected because a
+  path has not been expanded yet -- hence the ordering in `solve-base`."
+  [left right]
+  (if (empty? left)
+    right
+    (let [shared (vec (clojure.set/intersection (set (keys (first left))) (set (keys (first right)))))
+          idx (group-by #(mapv % shared) right)]
+      (vec (mapcat (fn [l] (map #(merge l %) (get idx (mapv l shared)))) left)))))
+
+(defn- solve-base
+  "Solve the BGP and expand the paths, INTERLEAVED.
+
+  The previous order solved the whole BGP first and then expanded paths. When a
+  path is the only thing connecting two parts of the pattern -- LDBC Interactive
+  Short 6 is exactly this shape, `(m {id: $id})-[:REPLY_OF*0..]->(p:Post)` joined
+  to a forum and its moderator -- the BGP alone is disconnected, so solving it
+  first produces the cross product of both halves before the path can prune it.
+  Measured 2026-08-13 on LDBC SF-0.1: IS 6 returned 135,701 rows for a query
+  whose correct answer is one row, and took 8.2 s to do it.
+
+  Components are solved independently, then joined only once something binds a
+  variable they share: a component is taken when it shares a variable with what
+  is already bound, and a path is expanded as soon as its `:from` is bound."
+  [engine-query where paths adjacency]
+  (let [components (connected-components where)]
+    (loop [bind-maps [] pending (vec components) remaining-paths (vec paths)]
+      (let [bound (if (seq bind-maps) (set (keys (first bind-maps))) #{})
+            ;; A path whose start is bound prunes; expand it before joining more.
+            ready-path (first (filter #(contains? bound (:from %)) remaining-paths))]
+        (cond
+          ready-path
+          (recur (expand-path bind-maps ready-path adjacency) pending
+                 (vec (remove #{ready-path} remaining-paths)))
+
+          (empty? pending)
+          ;; Any path left has an unbound start: nothing constrains it, so the
+          ;; general expansion is the honest answer rather than a guess.
+          (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps remaining-paths)
+
+          :else
+          (let [connected (filter #(seq (clojure.set/intersection bound (:vars %))) pending)
+                pick (first (or (seq connected) (seq pending)))
+                vars (pattern-vars (:clauses pick))
+                rows (rows->maps vars (engine-query {:find vars :where (:clauses pick)}))]
+            (recur (natural-join bind-maps rows)
+                   (vec (remove #{pick} pending))
+                   remaining-paths)))))))
 
 (defn- optional-join [engine-query bind-maps opt-patterns]
   (cond
@@ -308,11 +374,12 @@
                                  nil-fill (zipmap (remove (set bvars) all-union-vars) (repeat nil))]
                              (map #(merge nil-fill %) (rows->maps bvars (engine-query {:find bvars :where branch})))))
                          unions)))
-          (let [base-vars (pattern-vars where)]
-            (rows->maps base-vars (engine-query {:find base-vars :where where}))))
-        ;; Paths before filters and before OPTIONAL projections: a filter on a
-        ;; variable a path binds cannot run until the path has bound it.
-        bind-maps (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
+          (solve-base engine-query where paths adjacency))
+        ;; A union branch still expands its paths afterwards; only the plain
+        ;; BGP path gets the interleaved treatment.
+        bind-maps (if (seq unions)
+                    (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
+                    bind-maps)
         bind-maps (reduce (fn [bms opt-patterns] (optional-join engine-query bms opt-patterns))
                           bind-maps optionals)
         ;; Renames run AFTER the OPTIONAL projection blocks: `RETURN n.attr AS x`
