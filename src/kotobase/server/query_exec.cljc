@@ -124,6 +124,50 @@
                        [(merge bm nil-fill)])))
                  bind-maps))))
 
+(defn- bound-lookup-optional
+  "An OPTIONAL block of one triple whose subject is already bound, e.g. the
+  `[?n :firstName ?v]` a `RETURN n.firstName` compiles to. Evaluated as one
+  engine lookup per distinct bound subject.
+
+  The general path evaluates an OPTIONAL block as an INDEPENDENT engine query
+  and left-joins the result, which for this shape means scanning every value of
+  that attribute in the dataset. Measured 2026-08-13 on LDBC SF-0.1 (3,013,602
+  datoms, 303,482 entities): Interactive Short 1, a point lookup of one person,
+  did not finish in two minutes, with the main thread building a transient set
+  inside the engine -- it was materialising every entity's `:id` to answer
+  `RETURN p.id`. Property projection made this shape hot; before it, an OPTIONAL
+  block was rare and usually genuinely unbound."
+  [engine-query bind-maps [[s p o] :as patterns]]
+  (let [subjects (into #{} (keep #(get % s)) bind-maps)
+        rows (into {} (mapcat (fn [subj]
+                                (map (fn [[v]] [[subj v] true])
+                                     (engine-query {:find [o] :where [[subj p o]]}))))
+                   subjects)
+        by-subject (reduce (fn [acc [[subj v] _]] (update acc subj (fnil conj []) v)) {} rows)]
+    (vec (mapcat (fn [bm]
+                   (if-let [vs (seq (get by-subject (get bm s)))]
+                     (map #(assoc bm o %) vs)
+                     [(assoc bm o nil)]))
+                 bind-maps))))
+
+(defn- bound-lookup-shape?
+  "One triple, a variable subject already bound in every binding, a literal
+  predicate, and a variable object nothing has bound yet."
+  [bind-maps patterns]
+  (and (= 1 (count patterns))
+       (let [[s p o] (first patterns)]
+         (and (symbol? s) (not (symbol? p)) (symbol? o)
+              (seq bind-maps)
+              (contains? (first bind-maps) s)
+              (not (contains? (first bind-maps) o))))))
+
+(defn- optional-join [engine-query bind-maps opt-patterns]
+  (if (bound-lookup-shape? bind-maps opt-patterns)
+    (bound-lookup-optional engine-query bind-maps opt-patterns)
+    (let [opt-vars (pattern-vars opt-patterns)
+          opt-rows (engine-query {:find opt-vars :where opt-patterns})]
+      (left-join bind-maps opt-vars opt-rows))))
+
 (defn- comparable-value [s]
   (if (nil? s)
     nil
@@ -261,10 +305,7 @@
         ;; Paths before filters and before OPTIONAL projections: a filter on a
         ;; variable a path binds cannot run until the path has bound it.
         bind-maps (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
-        bind-maps (reduce (fn [bms opt-patterns]
-                            (let [opt-vars (pattern-vars opt-patterns)
-                                  opt-rows (engine-query {:find opt-vars :where opt-patterns})]
-                              (left-join bms opt-vars opt-rows)))
+        bind-maps (reduce (fn [bms opt-patterns] (optional-join engine-query bms opt-patterns))
                           bind-maps optionals)
         ;; Renames run AFTER the OPTIONAL projection blocks: `RETURN n.attr AS x`
         ;; is bound by one of those blocks, so renaming first copies a nil.
