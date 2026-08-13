@@ -25,13 +25,28 @@
 ;; ---------------------------------------------------------------- 回帰: silent misread
 
 (deftest variable-length-relationship-is-not-silently-a-single-hop
-  (testing "`-[:r*]->` は可変長パス。1 ホップの `-[:r]->` として受理してはいけない"
-    ;; 実測(修正前): tokenizer が `*` を捨て、[:r*] と [:r] が同じトークン列になり、
-    ;; 「1 ホップだけの答え」をエラー無しで返していた。
-    (is (rejected? "MATCH (a {x: 1})-[:r*]->(b {y: 2}) RETURN b"))
-    (is (rejected? "MATCH (a {x: 1})-[:r*1..3]->(b {y: 2}) RETURN b"))
-    (testing "そして 1 ホップの形は従来どおり通る(過剰拒否になっていない)"
-      (is (some? (parsed "MATCH (a {x: 1})-[:r]->(b {y: 2}) RETURN b"))))))
+  ;; 2026-08-13: 可変長パスは **実装された**。この deftest が守る不変条件は
+  ;; 「拒否すること」ではなく元から「1 ホップとして黙って受理しないこと」なので、
+  ;; 主張を「別の compiled 形になる」に置き換える。拒否のままにすると、実装済みの
+  ;; 機能を検査しない死んだテストになる。
+  (testing "`-[:r*]->` は 1 ホップの `-[:r]->` と同じ compiled 形にならない"
+    ;; 実測(2026-08-04 修正前): tokenizer が `*` を捨て、[:r*] と [:r] が同じ
+    ;; トークン列になり、「1 ホップだけの答え」をエラー無しで返していた。
+    (let [one-hop (parsed "MATCH (a {x: 1})-[:r]->(b {y: 2}) RETURN b")
+          star    (parsed "MATCH (a {x: 1})-[:r*]->(b {y: 2}) RETURN b")
+          ranged  (parsed "MATCH (a {x: 1})-[:r*1..3]->(b {y: 2}) RETURN b")]
+      (is (some? one-hop))
+      (is (empty? (:paths one-hop)) "1 ホップは BGP のまま(engine push-down を失わない)")
+      (is (not= one-hop star))
+      (is (= [{:min 1 :max nil}] (mapv #(select-keys % [:min :max]) (:paths star))))
+      (is (= [{:min 1 :max 3}] (mapv #(select-keys % [:min :max]) (:paths ranged))))))
+  (testing "境界の形も取り違えない"
+    (is (= [{:min 0 :max nil}]
+           (mapv #(select-keys % [:min :max])
+                 (:paths (parsed "MATCH (a {x: 1})-[:r*0..]->(b {y: 2}) RETURN b")))))
+    (is (= [{:min 2 :max 2}]
+           (mapv #(select-keys % [:min :max])
+                 (:paths (parsed "MATCH (a {x: 1})-[:r*2]->(b {y: 2}) RETURN b")))))))
 
 (deftest regex-match-is-not-silently-equality
   (testing "`=~` は正規表現マッチ。`=` として受理してはいけない"
@@ -70,9 +85,15 @@
 
 (deftest documented-exclusions-are-loud
   (testing "docstring が「rejected」と書いている形は、実際にエラーになる"
+    ;; 2026-08-13: ラベルと右→左は実装したのでこの一覧から外した。両方が
+    ;; 「受理され、かつ正しく実行される」ことは cypher-ldbc-test が実測する。
     (doseq [q ["MATCH (n) RETURN n"                                    ; 暗黙の全走査はしない
-               "MATCH (n:Person {x: 1}) RETURN n"                      ; ラベル未対応
-               "MATCH (a {x: 1})<-[:r]-(b {y: 2}) RETURN b"            ; 右→左
                "OPTIONAL MATCH (a {x: 1}) RETURN a"                    ; MATCH で始まらない
+               "MATCH (a {x: 1})-[:r]->(b) WITH b RETURN b"            ; WITH 未対応
+               "MATCH (a {x: 1}) RETURN coalesce(a.x, a.y)"            ; 関数呼び出し未対応
                "RETURN 1"]]
-      (is (rejected? q) (str "loud reject されるべき: " q)))))
+      (is (rejected? q) (str "loud reject されるべき: " q))))
+  (testing "実装した形は受理される(過剰拒否になっていない)"
+    (doseq [q ["MATCH (n:Person {x: 1}) RETURN n"
+               "MATCH (a {x: 1})<-[:r]-(b {y: 2}) RETURN b"]]
+      (is (some? (parsed q)) (str "受理されるべき: " q)))))
