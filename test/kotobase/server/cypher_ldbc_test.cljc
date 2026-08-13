@@ -217,3 +217,22 @@
     (is (= 3 (count (distinct (map first rows)))))
     (is (= 2 (count (distinct (map second rows)))))
     (is (= 6 (count rows)))))
+
+(deftest a-bound-component-is-queried-selectively-not-scanned
+  ;; The behaviour, observed rather than asserted about internals: count the
+  ;; engine calls and how broad each one is. Without pushdown the forum
+  ;; component is solved against the whole dataset once; with it, the engine is
+  ;; asked about the one post the path already identified.
+  (let [asked (atom [])
+        counting (fn [q] (swap! asked conj (:where q)) (engine-query q))
+        q (str "MATCH (c:Comment {id: \"12\"})-[:replyOf*0..]->(m:Post), "
+               "(f:Forum)-[:containerOf]->(m) RETURN m.id, f.id")
+        result (qe/execute counting (cypher/parse q) adjacency)]
+    (is (= #{["10" "40"]} (set (:rows result))) "the answer is unchanged")
+    (is (some (fn [where]
+                (some (fn [[s p o]] (and (= p ":containerOf") (not (symbol? o)))) where))
+              @asked)
+        "the forum component was asked about a KNOWN post, not about every post")))
+
+(deftest pushdown-does-not-change-answers-when-the-bound-side-is-empty
+  (is (= [] (:rows (run "MATCH (c:Comment {id: \"nope\"})-[:replyOf*0..]->(m:Post), (f:Forum)-[:containerOf]->(m) RETURN m.id")))))
