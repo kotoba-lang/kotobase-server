@@ -135,8 +135,54 @@
     (is (= #{["Ada" "1" "9"]} (rows-of q {"personId" "1"})))))
 
 (deftest still-rejects-what-is-still-outside-the-subset
-  (doseq [[label q] [["WITH"     "MATCH (a {id: \"1\"})-[:knows]->(b) WITH b RETURN b"]
-                     ["coalesce" "MATCH (a {id: \"1\"}) RETURN coalesce(a.x, a.y)"]]]
+  ;; 2026-08-13 second pass: coalesce is now implemented, so it moved out of this
+  ;; list and into its own execution test. WITH is still outside the subset.
+  (doseq [[label q] [["WITH"            "MATCH (a {id: \"1\"})-[:knows]->(b) WITH b RETURN b"]
+                     ["unknown function" "MATCH (a {id: \"1\"}) RETURN upper(a.x)"]
+                     ["SKIP"            "MATCH (a {id: \"1\"}) RETURN a SKIP 2"]]]
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
                  (cypher/parse q {}))
         (str label " must still be rejected loudly, not approximated"))))
+
+;; ---------------------------------------------------------------- 2026-08-13, second pass
+
+(deftest anonymous-nodes-still-constrain-the-match
+  (testing "an anonymous labelled node narrows, it is not skipped"
+    (is (= #{["2"]} (rows-of "MATCH (:Person {id: \"1\"})-[:knows]->(b) RETURN b.id")))
+    ;; If the anonymous node were dropped, this would match every :knows edge.
+    (is (= #{} (rows-of "MATCH (:Forum {id: \"1\"})-[:knows]->(b) RETURN b.id")))))
+
+(deftest optional-match-is-a-left-join-not-a-filter
+  (testing "a person with no city still comes back, with nil"
+    (is (= #{["1" "9"] ["2" nil] ["3" nil]}
+           (rows-of (str "MATCH (n:Person) OPTIONAL MATCH (n)-[:isLocatedIn]->(c:City) "
+                         "RETURN n.id, c.id")))))
+  (testing "an undirected or variable-length hop inside OPTIONAL is refused, not silently directed"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+                          #"OPTIONAL MATCH cannot contain"
+                          (cypher/parse "MATCH (n:Person) OPTIONAL MATCH (n)-[:knows]-(f) RETURN n.id")))))
+
+(deftest coalesce-returns-the-first-non-null
+  (testing "falls through to the second argument when the first is absent"
+    (is (= #{["x.jpg"]}
+           (rows-of "MATCH (m:Comment {id: \"11\"}) RETURN coalesce(m.content, m.imageFile) AS body"))))
+  (testing "takes the first when it is present"
+    (is (= #{["root"]}
+           (rows-of "MATCH (m:Post {id: \"10\"}) RETURN coalesce(m.content, m.imageFile) AS body"))))
+  (testing "both absent is null, not an error"
+    (is (= [[nil]]
+           (:rows (run "MATCH (m:Comment {id: \"12\"}) RETURN coalesce(m.content, m.imageFile) AS body"))))))
+
+(deftest tointeger-orders-numerically-not-lexically
+  ;; The reason the cast is recorded rather than dropped: as text, "10" sorts
+  ;; before "9". LDBC IS 3 orders person ids numerically.
+  (let [q "MATCH (n:Person) RETURN n.id AS pid ORDER BY toInteger(pid) ASC"]
+    (is (= [["1"] ["2"] ["3"]] (:rows (run q)))))
+  (testing "toInteger in RETURN yields a number"
+    (is (= [[1]] (:rows (run "MATCH (n:Person {id: \"1\"}) RETURN toInteger(n.id) AS i")))))
+  (testing "a non-numeric value casts to null rather than throwing"
+    (is (= [[nil]] (:rows (run "MATCH (n:Person {id: \"1\"}) RETURN toInteger(n.firstName) AS i"))))))
+
+(deftest an-unknown-function-is-rejected-at-parse-time
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+               (cypher/parse "MATCH (n:Person {id: \"1\"}) RETURN upper(n.firstName)" {}))))

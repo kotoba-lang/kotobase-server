@@ -53,6 +53,26 @@
                            (pr-str (vec unknown)))
                       {:kotobase/error :unexecutable-query :unknown (vec unknown)})))))
 
+(defn- fn-arg [bm a]
+  (cond (and (vector? a) (= :lit (first a))) (second a)
+        (symbol? a) (get bm a)
+        :else a))
+
+(defn- apply-fn
+  "The whitelisted RETURN functions. Kept tiny and total on purpose: a function
+  that cannot compute returns nil rather than throwing mid-projection, which is
+  what Cypher does with a missing property."
+  [{:keys [fn args]} bm]
+  (let [vs (mapv #(fn-arg bm %) args)]
+    (case fn
+      ;; Cypher coalesce: the first non-null argument.
+      :coalesce (first (remove nil? vs))
+      :tointeger (let [v (first vs)]
+                   (when (and v (re-matches #"-?[0-9]+" (str v)))
+                     #?(:clj (Long/parseLong (str v)) :cljs (js/parseInt (str v) 10))))
+      (throw (ex-info (str "no implementation for RETURN function " fn)
+                      {:kotobase/error :unimplemented-function :fn fn})))))
+
 (defn- expand-path
   "One `:paths` entry against bind-maps. BFS from each already-bound `:from`
   value, following `attr` (both directions when `:both`), emitting one binding
@@ -144,13 +164,22 @@
           (let [idx-of (fn [v] (let [i (.indexOf find-keys v)]
                                  (when (neg? i) (throw (ex-info "ORDER BY var not projected" {:var v})))
                                  i))
-                specs (mapv (fn [{:keys [var dir]}] [(idx-of var) (or dir :asc)]) order-by)
-                keyfn (fn [row] (mapv (fn [[i _]] (comparable-value (nth row i))) specs))
+                specs (mapv (fn [{:keys [var dir cast]}] [(idx-of var) (or dir :asc) cast]) order-by)
+                ;; A recorded ORDER BY cast is applied here. `comparable-value`
+                ;; already promotes numeric-looking strings, so :tointeger is
+                ;; usually a no-op -- but it is applied explicitly so a
+                ;; non-numeric value sorts as nil rather than as text.
+                keyfn (fn [row] (mapv (fn [[i _ cast]]
+                                        (let [v (comparable-value (nth row i))]
+                                          (if (= :tointeger cast)
+                                            (when (number? v) v)
+                                            v)))
+                                      specs))
                 cmp (fn [ka kb]
                       (loop [n 0]
                         (if (= n (count specs))
                           0
-                          (let [[_ dir] (nth specs n)
+                          (let [[_ dir _] (nth specs n)
                                 a (nth ka n) b (nth kb n)
                                 c (cond (and (number? a) (number? b)) (compare a b)
                                         :else (compare (str a) (str b)))
@@ -243,7 +272,12 @@
                             (mapv (fn [bm] (assoc bm to (get bm from))) bms))
                           bind-maps (or renames []))
         bind-maps (reduce (fn [bms f] (filterv (filter-pred f) bms)) bind-maps filters)
-        aggregate? (some map? find)
+        ;; Whitelisted scalar functions, computed per row before projection.
+        bind-maps (reduce (fn [bms item]
+                            (mapv (fn [bm] (assoc bm (:as item) (apply-fn item bm))) bms))
+                          bind-maps (filterv :fn find))
+        find (mapv (fn [item] (if (:fn item) (:as item) item)) find)
+        aggregate? (some :agg find)
         rows
         (cond
           aggregate?
