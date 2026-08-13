@@ -35,6 +35,53 @@
 
 (declare execute-post-pass execute-pushed)
 
+;; Every key a compiled query may carry. `execute` refuses anything else.
+;;
+;; This exists because the failure it prevents is silent. On 2026-08-13 the
+;; Cypher parser gained :paths, :renames and :distinct; an executor that simply
+;; did not look at them would have answered every variable-length, undirected or
+;; DISTINCT query with the wrong rows and no error at all. A compiled query
+;; naming something the executor cannot do must fail, not be approximated.
+(def ^:private known-keys
+  #{:find :where :unions :optionals :filters :group-by :order-by :limit
+    :paths :renames :distinct})
+
+(defn- assert-executable! [compiled]
+  (let [unknown (remove known-keys (keys compiled))]
+    (when (seq unknown)
+      (throw (ex-info (str "compiled query uses constructs this executor does not implement: "
+                           (pr-str (vec unknown)))
+                      {:kotobase/error :unexecutable-query :unknown (vec unknown)})))))
+
+(defn- expand-path
+  "One `:paths` entry against bind-maps. BFS from each already-bound `:from`
+  value, following `attr` (both directions when `:both`), emitting one binding
+  per reachable node between :min and :max hops.
+
+  `:max nil` means unbounded, so the visited set is per-seed and mandatory:
+  LDBC's REPLY_OF chains are acyclic but `knows` is not, and an unbounded walk
+  over a cyclic graph without one does not terminate."
+  [bind-maps {:keys [from to attr min max both rel-var]} adjacency]
+  (let [step (fn [node] (adjacency attr node both))]
+    (vec (mapcat
+          (fn [bm]
+            (let [seed (get bm from)]
+              (if (nil? seed)
+                []
+                (loop [frontier [seed] depth 0 seen #{seed} out []]
+                  (let [out (if (>= depth min)
+                              (into out (map (fn [n]
+                                               (cond-> (assoc bm to n)
+                                                 rel-var (assoc rel-var (str attr "|" n))))
+                                             frontier))
+                              out)]
+                    (if (or (and max (>= depth max)) (empty? frontier))
+                      out
+                      (let [next-frontier (vec (remove seen (distinct (mapcat step frontier))))]
+                        (recur next-frontier (inc depth)
+                               (into seen next-frontier) out))))))))
+          bind-maps))))
+
 (defn- pattern-vars [patterns]
   (vec (distinct (filter symbol? (mapcat identity patterns)))))
 
@@ -154,14 +201,24 @@
 (defn execute
   "engine-query: (fn [{:find [...] :where [...]}]) -> seq of tuples.
   Returns {:vars [...] :rows [[...]...]} after UNION/OPTIONAL/FILTER/
-  aggregation/ORDER BY."
-  [engine-query {:keys [find where unions optionals filters group-by order-by limit] :as compiled}]
-  (if (and (pushable? compiled) (empty? unions))
-    (execute-pushed engine-query compiled)
-    (execute-post-pass engine-query compiled)))
+  aggregation/ORDER BY.
+
+  `adjacency`: (fn [attr node both?]) -> seq of neighbours, required only when
+  the compiled query carries `:paths`. Absent, a `:paths` query fails rather
+  than silently returning the zero-hop answer."
+  ([engine-query compiled] (execute engine-query compiled nil))
+  ([engine-query {:keys [unions paths] :as compiled} adjacency]
+   (assert-executable! compiled)
+   (when (and (seq paths) (nil? adjacency))
+     (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
+                     {:kotobase/error :adjacency-required})))
+   (if (and (pushable? compiled) (empty? unions) (empty? paths))
+     (execute-pushed engine-query compiled)
+     (execute-post-pass engine-query compiled adjacency))))
 
 (defn- execute-post-pass
-  [engine-query {:keys [find where unions optionals filters group-by order-by limit]}]
+  [engine-query {:keys [find where unions optionals filters group-by order-by limit
+                        paths renames distinct]} adjacency]
   (let [bind-maps
         (if (seq unions)
           (let [all-union-vars (vec (distinct (mapcat pattern-vars unions)))]
@@ -172,11 +229,19 @@
                          unions)))
           (let [base-vars (pattern-vars where)]
             (rows->maps base-vars (engine-query {:find base-vars :where where}))))
+        ;; Paths before filters and before OPTIONAL projections: a filter on a
+        ;; variable a path binds cannot run until the path has bound it.
+        bind-maps (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
         bind-maps (reduce (fn [bms opt-patterns]
                             (let [opt-vars (pattern-vars opt-patterns)
                                   opt-rows (engine-query {:find opt-vars :where opt-patterns})]
                               (left-join bms opt-vars opt-rows)))
                           bind-maps optionals)
+        ;; Renames run AFTER the OPTIONAL projection blocks: `RETURN n.attr AS x`
+        ;; is bound by one of those blocks, so renaming first copies a nil.
+        bind-maps (reduce (fn [bms [from to]]
+                            (mapv (fn [bm] (assoc bm to (get bm from))) bms))
+                          bind-maps (or renames []))
         bind-maps (reduce (fn [bms f] (filterv (filter-pred f) bms)) bind-maps filters)
         aggregate? (some map? find)
         rows
@@ -193,6 +258,7 @@
                           find))
                   groups))
           :else (mapv (fn [bm] (mapv #(get bm %) find)) bind-maps))
+        rows (if distinct (vec (clojure.core/distinct rows)) rows)
         find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
         rows (order-and-limit rows find-keys order-by limit)]
     {:vars (mapv str find-keys)
