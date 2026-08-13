@@ -162,11 +162,19 @@
               (not (contains? (first bind-maps) o))))))
 
 (defn- optional-join [engine-query bind-maps opt-patterns]
-  (if (bound-lookup-shape? bind-maps opt-patterns)
+  (cond
+    ;; Nothing to left-join onto. The general path would still run the OPTIONAL
+    ;; block as an independent query -- scanning the attribute across the whole
+    ;; dataset to produce rows that are then joined against nothing. Measured
+    ;; 2026-08-13: a query whose base pattern matched nothing spent minutes here
+    ;; before returning the empty answer it already had.
+    (empty? bind-maps) bind-maps
+    :else
+    (if (bound-lookup-shape? bind-maps opt-patterns)
     (bound-lookup-optional engine-query bind-maps opt-patterns)
-    (let [opt-vars (pattern-vars opt-patterns)
-          opt-rows (engine-query {:find opt-vars :where opt-patterns})]
-      (left-join bind-maps opt-vars opt-rows))))
+      (let [opt-vars (pattern-vars opt-patterns)
+            opt-rows (engine-query {:find opt-vars :where opt-patterns})]
+        (left-join bind-maps opt-vars opt-rows)))))
 
 (defn- comparable-value [s]
   (if (nil? s)
