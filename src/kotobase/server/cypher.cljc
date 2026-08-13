@@ -112,6 +112,11 @@
 
 (defn- attr-name [t] (if (str/starts-with? t ":") t (str ":" t)))
 
+(def ^:private ^:dynamic *anon* nil)
+
+(defn- anon-name []
+  (str "__anon" (swap! *anon* inc)))
+
 (defn- parse-int [t]
   #?(:clj (Long/parseLong (str t)) :cljs (js/parseInt (str t) 10)))
 
@@ -121,6 +126,9 @@
 
 (def ^:private where-ops {"=" := "<>" :not= "<" :< "<=" :<= ">" :> ">=" :>=})
 (def ^:private return-aggs #{"count" "sum" "min" "max" "avg"})
+;; Whitelist, not a general call syntax: each name has an implementation in
+;; query-exec, and an unknown name is rejected rather than ignored.
+(def ^:private return-fns #{"coalesce" "tointeger"})
 
 (defn- parse-props
   "After '{': attr : lit [, attr : lit]* '}' -> [rest-tokens clauses]."
@@ -154,7 +162,13 @@
   [ts clauses]
   (let [[open v & more] ts]
     (when-not (= "(" open) (fail "node pattern must open with (" open))
-    (when-not (ident? v) (fail "node needs a variable name (anonymous nodes unsupported)" v))
+    ;; `(:Label {..})` and `()` -- LDBC IS2 opens with one. The variable is
+    ;; generated rather than the node being skipped: an unnamed node still
+    ;; constrains the pattern, and dropping it would widen the match.
+    (let [anon? (not (ident? v))
+          more (if anon? (cons v more) more)
+          v (if anon? (anon-name) v)]
+      (when-not (or anon? (ident? v)) (fail "node needs a variable name" v))
     (let [sym (symbol (str "?" v))
           before (count clauses)
           [more clauses] (parse-labels more sym clauses)
@@ -167,7 +181,7 @@
           (if (= ")" (first ts))
             [(vec (rest ts)) sym clauses true]
             (fail "node must close with )" (first ts))))
-        :else (fail "node must close with ) or contain {props}" (first more))))))
+        :else (fail "node must close with ) or contain {props}" (first more)))))))
 
 (defn- parse-rel-detail
   "Inside `[ ... ]`: [relvar] ':' attr ['*' [min] ['..' [max]]]
@@ -256,6 +270,38 @@
 (defn- projection-var [v k]
   (symbol (str "?" v "__" (str/replace k "/" "_"))))
 
+(defn- parse-fn-call
+  "fn(arg, ...) [AS alias] -> [rest-tokens {:fn :coalesce :args [...] :as ?a} projections].
+  A `v.attr` argument is bound through the same OPTIONAL projection machinery as
+  a bare `RETURN v.attr`, so a missing property is null here too -- which is the
+  whole point of `coalesce(m.content, m.imageFile)` in LDBC IS 4."
+  [ts projs ordinal]
+  (let [fname (keyword (str/lower-case (first ts)))]
+    (loop [ts (vec (drop 2 ts)) args [] projs projs]
+      (cond
+        (and (ident? (first ts)) (= "." (second ts)) (ident? (nth ts 2 nil)))
+        (let [v (first ts) k (nth ts 2)
+              pv (projection-var v k)]
+          (recur (vec (drop 3 ts)) (conj args pv)
+                 (conj projs {:block [[(symbol (str "?" v)) (attr-name k) pv]] :bind pv})))
+        (= "," (first ts)) (recur (vec (rest ts)) args projs)
+        (literal? (first ts))
+        (recur (vec (rest ts)) (conj args [:lit (literal->value (first ts))]) projs)
+        (and (ident? (first ts)) (not= "(" (second ts)))
+        (recur (vec (rest ts)) (conj args (symbol (str "?" (first ts)))) projs)
+        (= ")" (first ts))
+        (let [more (vec (rest ts))
+              [alias more] (if (kw? (first more) "AS")
+                             (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                                 [(symbol (str "?" (second more))) (vec (drop 2 more))])
+                             [(symbol (str "?" (name fname) "_" ordinal)) more])]
+          (when (empty? args) (fail "function call needs at least one argument" (name fname)))
+          (when (and (= :tointeger fname) (not= 1 (count args)))
+            (fail "toInteger takes exactly one argument" (name fname)))
+          [more {:fn fname :args args :as alias} projs])
+        :else (fail "unsupported function argument" (first ts))))))
+
+
 (defn parse
   "Cypher subset text -> {:find [...] :where [[s p o] ...] :optionals [...]
   :paths [...] :order-by :filters :group-by :distinct :limit}.
@@ -265,7 +311,8 @@
   value is a failure, never an empty match."
   ([text] (parse text nil))
   ([text params]
-   (let [ts (substitute-params (tokenize (str text)) params)]
+   (binding [*anon* (atom 0)]
+    (let [ts (substitute-params (tokenize (str text)) params)]
     (when (empty? ts) (fail "empty query" ""))
     (when-not (kw? (first ts) "MATCH") (fail "must start with MATCH" (first ts)))
     (let [[ts clauses paths]
@@ -274,6 +321,24 @@
               (if (= "," (first ts))
                 (recur (vec (rest ts)) clauses paths)
                 [ts clauses paths])))
+          ;; OPTIONAL MATCH -> one :optionals block per clause. The executor has
+          ;; had left-join since the SPARQL work; only the parser was missing.
+          [ts match-optionals]
+          (loop [ts ts acc []]
+            (if (and (kw? (first ts) "OPTIONAL") (kw? (second ts) "MATCH"))
+              (let [[ts oc op]
+                    (loop [ts (vec (drop 2 ts)) oc [] op []]
+                      (let [[ts oc op] (parse-one-pattern ts oc op)]
+                        (if (= "," (first ts))
+                          (recur (vec (rest ts)) oc op)
+                          [ts oc op])))]
+                ;; A variable-length or undirected hop inside OPTIONAL would need
+                ;; path expansion under a left join, which the executor does not
+                ;; do. Reject rather than answer the directed single-hop version.
+                (when (seq op)
+                  (fail "OPTIONAL MATCH cannot contain a variable-length or undirected relationship" "OPTIONAL MATCH"))
+                (recur ts (conj acc (mapv vec oc))))
+              [ts acc]))
           [ts clauses filters]
           (if (kw? (first ts) "WHERE")
             (loop [ts (rest ts) clauses clauses filters []]
@@ -316,6 +381,14 @@
                   (if (= "," (first more))
                     (recur (vec (rest more)) acc projs)
                     [(vec more) acc projs])))
+              ;; fn(arg, ...) [AS alias] -- coalesce / toInteger
+              (and (ident? (first ts)) (contains? return-fns (str/lower-case (first ts)))
+                   (= "(" (second ts)))
+              (let [[more item projs] (parse-fn-call ts projs (count acc))
+                    acc (conj acc item)]
+                (if (= "," (first more))
+                  (recur (vec (rest more)) acc projs)
+                  [more acc projs]))
               ;; v.attr [AS alias]
               (and (ident? (first ts)) (= "." (second ts)) (ident? (nth ts 2 nil)))
               (let [v (first ts) k (nth ts 2)
@@ -354,15 +427,28 @@
             (do (when-not (kw? (second ts) "BY") (fail "ORDER must be followed by BY" (second ts)))
                 (loop [ts (vec (drop 2 ts)) acc []]
                   (if (and (seq ts) (ident? (first ts)) (not (kw? (first ts) "LIMIT")))
-                    (let [;; ORDER BY v.attr as well as ORDER BY alias
+                    (let [;; ORDER BY v.attr, ORDER BY alias, or ORDER BY fn(alias).
+                          ;; A cast is recorded rather than dropped: ordering
+                          ;; "10" before "9" is a different answer from ordering
+                          ;; 9 before 10, and LDBC IS 3 asks for the numeric one.
+                          fn-cast? (and (contains? return-fns (str/lower-case (first ts)))
+                                        (= "(" (second ts)))
+                          [cast ts] (if fn-cast?
+                                      [(keyword (str/lower-case (first ts))) (vec (drop 2 ts))]
+                                      [nil ts])
                           [v ts] (if (and (= "." (second ts)) (ident? (nth ts 2 nil)))
                                    [(projection-var (first ts) (nth ts 2)) (vec (drop 3 ts))]
                                    [(symbol (str "?" (first ts))) (vec (rest ts))])
+                          ts (if fn-cast?
+                               (do (when-not (= ")" (first ts))
+                                     (fail "ORDER BY function must close with )" (first ts)))
+                                   (vec (rest ts)))
+                               ts)
                           [dir ts] (cond
                                      (kw? (first ts) "DESC") [:desc (vec (rest ts))]
                                      (kw? (first ts) "ASC") [:asc (vec (rest ts))]
                                      :else [:asc ts])
-                          acc (conj acc {:var v :dir dir})]
+                          acc (conj acc (cond-> {:var v :dir dir} cast (assoc :cast cast)))]
                       (if (= "," (first ts))
                         (recur (vec (rest ts)) acc)
                         [ts acc]))
@@ -374,12 +460,16 @@
             (and (kw? (first ts) "LIMIT") (= 2 (count ts)) (re-matches #"[0-9]+" (second ts)))
             (parse-int (second ts))
             :else (fail "only ORDER BY / LIMIT allowed after RETURN" (first ts)))
-          bound (into (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
-                      (mapcat (fn [{:keys [from to rel-var]}] (filter symbol? [from to rel-var])) paths))
+          bound (-> (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
+                    (into (mapcat (fn [{:keys [from to rel-var]}] (filter symbol? [from to rel-var])) paths))
+                    ;; OPTIONAL MATCH binds too -- nullably, but bound.
+                    (into (mapcat (fn [blk] (mapcat (fn [[s _ o]] (filter symbol? [s o])) blk))
+                                  match-optionals)))
           renames (filterv :rename projections)
-          optionals (mapv :block (filterv :block projections))
+          optionals (into (vec match-optionals) (mapv :block (filterv :block projections)))
           projected (set (filter symbol? find-vars))
-          agg-items (filterv map? find-vars)
+          agg-items (filterv :agg find-vars)
+          fn-items (filterv :fn find-vars)
           bare-vars (filterv symbol? find-vars)
           group-by' (when (seq agg-items)
                       (vec (remove (set (map :as (filterv :block projections))) bare-vars)))]
@@ -399,9 +489,17 @@
         (when-not (or (bound v) (projected v)) (fail "RETURN variable not bound in MATCH/WHERE" (str v))))
       (doseq [{:keys [var]} agg-items]
         (when-not (bound var) (fail "aggregate variable not bound in MATCH/WHERE" (str var))))
+      ;; Every function argument must be a literal, a MATCH variable, or a
+      ;; projection this query binds. An unbound one would compute over nil.
+      (let [projection-binds (set (keep :bind projections))]
+        (doseq [{:keys [fn args]} fn-items]
+          (doseq [a args]
+            (when (and (symbol? a) (not (bound a)) (not (projection-binds a)))
+              (fail (str (name fn) " argument not bound in MATCH/WHERE") (str a))))))
       (doseq [{:keys [var]} order-by']
         (when-not (or (projected var)
-                      (some (fn [it] (and (map? it) (= var (:as it)))) agg-items))
+                      (some (fn [it] (= var (:as it))) agg-items)
+                      (some (fn [it] (= var (:as it))) fn-items))
           (fail "ORDER BY var must be in RETURN" (str var))))
       (cond-> {:find (vec find-vars) :where (mapv vec clauses)}
         (seq optionals) (assoc :optionals optionals)
@@ -411,4 +509,4 @@
         (seq filters) (assoc :filters filters)
         (seq group-by') (assoc :group-by group-by')
         distinct? (assoc :distinct true)
-        limit (assoc :limit limit))))))
+        limit (assoc :limit limit)))))))
