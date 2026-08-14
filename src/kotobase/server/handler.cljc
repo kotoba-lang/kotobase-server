@@ -795,9 +795,20 @@
   (let [chain ((:head-get store) graph)]
     (then* (hot-db store chain)
            (fn [db]
-             (let [{:keys [vars rows]} (qx/execute
-                                        (fn [q] (eng/query db q (visible-of store)))
-                                        parsed)]
+             (let [visible? (visible-of store)
+                   engine-query (fn [q] (eng/query db q visible?))
+                   adjacency (fn [attr node both?]
+                               (concat
+                                (map first
+                                     (engine-query
+                                      {:find ['?object]
+                                       :where [[node attr '?object]]}))
+                                (when both?
+                                  (map first
+                                       (engine-query
+                                        {:find ['?subject]
+                                         :where [['?subject attr node]]})))))
+                   {:keys [vars rows]} (qx/execute engine-query parsed adjacency)]
                {:ok true :graph graph :vars vars :rows rows})))))
 
 (defn do-sparql
