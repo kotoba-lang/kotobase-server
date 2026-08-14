@@ -8,6 +8,7 @@
   Supported, and ONLY this:
 
     MATCH p1, p2, ...
+    [OPTIONAL MATCH p1, p2, ...] ...
     [WHERE v.attr = lit AND v.attr = lit ...]
     RETURN [DISTINCT] item, ...
     [ORDER BY item [ASC|DESC], ...] [LIMIT n]
@@ -18,6 +19,8 @@
              | -[[relvar] :attr [*range]]-    undirected
     range   := * | *n | *n.. | *n..m | *..m   (bare * is 1.., UNBOUNDED)
     item    := v | v.attr [AS alias] | agg(v) [AS alias]
+             | coalesce(item, ...) [AS alias]
+             | toInteger(item) [AS alias]
     lit     := \"string\" | 'string' | integer | decimal | $param
 
   Attribute names are used as stored: a rel type `[:sp/knows]` matches the
@@ -37,10 +40,15 @@
   query carrying a construct it cannot evaluate rather than approximating
   it.
 
-  Not supported (rejected): OPTIONAL MATCH, WITH, function calls
-  (coalesce/toInteger/...), WHERE operators other than `=` `<>` `<` `<=`
-  `>` `>=` joined by AND, OR/NOT, anonymous nodes, SKIP, and every write
-  form (CREATE/MERGE/DELETE/SET -- this surface is read-only)."
+  OPTIONAL MATCH supports ordinary directed fixed-hop BGPs. Variable-length or
+  undirected relationships inside OPTIONAL are rejected; both are supported in
+  the primary MATCH. Anonymous nodes are accepted when the surrounding pattern
+  binds the query.
+
+  Not supported (rejected): WITH, CASE and functions other than coalesce and
+  toInteger, WHERE operators other than `=` `<>` `<` `<=` `>` `>=` joined by
+  AND, OR/NOT, OPTIONAL variable-length/undirected relationships, SKIP, and
+  every write form (CREATE/MERGE/DELETE/SET -- this surface is read-only)."
   (:require [clojure.string :as str]))
 
 (def grammar-help

@@ -78,3 +78,46 @@
                            :where '[[?e ":city" ?city]]
                            :optionals '[[[?e ":nick" ?n]]]})]
     (is (>= (count @calls) 2) "OPTIONAL runs a second engine query (post-pass left join), not a single pushed query")))
+
+(deftest multi-clause-optional-pushes-existing-bindings
+  (let [queries (atom [])
+        eng (fn [{:keys [find where] :as q}]
+              (swap! queries conj q)
+              (cond
+                (= where '[[?e ":kind" "person"]]) [["e1"]]
+                (= where '[[?friend ":name" ?name]
+                           ["e1" ":knows" ?friend]]) [["e2" "Ada"]]
+                :else []))
+        r (qx/execute eng {:find '[?e ?name]
+                           :where '[[?e ":kind" "person"]]
+                           :optionals '[[[?e ":knows" ?friend]
+                                        [?friend ":name" ?name]]]})]
+    (is (= [["e1" "Ada"]] (:rows r)))
+    (is (some #(= '[[?friend ":name" ?name]
+                    ["e1" ":knows" ?friend]] (:where %)) @queries)
+        "the general OPTIONAL path substitutes the already-bound subject")
+    (is (not-any? #(= '[[?e ":knows" ?friend]
+                        [?friend ":name" ?name]] (:where %)) @queries)
+        "it does not issue the former dataset-wide OPTIONAL scan")))
+
+(deftest planner-starts-with-the-most-selective-disconnected-component
+  (let [queries (atom [])
+        eng (fn [q] (swap! queries conj q) [])]
+    (qx/execute eng {:find '[?e]
+                     :where '[[?e ":broad" ?v]
+                              [?seed ":id" "fixed-id"]]
+                     :distinct true})
+    (is (= '[[?seed ":id" "fixed-id"]]
+           (:where (first @queries)))
+        "literal-bearing component is planned before an unrelated broad scan")))
+
+(deftest distinct-never-enters-the-pushdown-path-that-ignores-it
+  (let [queries (atom [])
+        eng (fn [q]
+              (swap! queries conj q)
+              [["e1"] ["e1"]])
+        r (qx/execute eng {:find '[?e]
+                           :where '[[?e ":kind" "person"]]
+                           :distinct true})]
+    (is (= [["e1"]] (:rows r)))
+    (is (= 1 (count @queries)))))

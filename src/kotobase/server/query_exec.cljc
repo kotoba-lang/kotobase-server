@@ -176,6 +176,30 @@
                      :clauses (into [clause] (mapcat :clauses touching))})))
           [] clauses))
 
+(defn- component-score
+  "Planner score for choosing the next disconnected BGP component.
+
+  Existing bindings dominate because substituting them turns a broad scan into
+  keyed lookups.  With no bindings, literal terms are the only selectivity
+  signal available without engine statistics; more clauses are the stable
+  final tie-breaker.  Keeping this heuristic here makes the choice explicit and
+  replaceable when the engine exposes cardinality estimates."
+  [bound {:keys [vars clauses]}]
+  [(count (clojure.set/intersection bound vars))
+   (reduce (fn [score [s p o]]
+             (+ score
+                (if (symbol? s) 0 10)
+                (cond
+                  (symbol? o) 0
+                  (= p ":label") 0
+                  (or (= p ":id") (str/ends-with? (str p) "/id")) 10
+                  :else 2)))
+           0 clauses)
+   (- (count clauses))])
+
+(defn- pick-component [bound components]
+  (last (sort-by #(component-score bound %) components)))
+
 (defn- natural-join
   "Hash join two bind-map seqs on the variables they share. With no shared
   variable this is a cross product, which is the correct answer for a genuinely
@@ -256,7 +280,8 @@
 
           :else
           (let [connected (filter #(seq (clojure.set/intersection bound (:vars %))) pending)
-                pick (first (or (seq connected) (seq pending)))
+                candidates (or (seq connected) (seq pending))
+                pick (pick-component bound candidates)
                 rows (solve-component engine-query bind-maps pick)]
             (recur (natural-join bind-maps rows)
                    (vec (remove #{pick} pending))
@@ -272,9 +297,24 @@
     (empty? bind-maps) bind-maps
     :else
     (if (bound-lookup-shape? bind-maps opt-patterns)
-    (bound-lookup-optional engine-query bind-maps opt-patterns)
+      (bound-lookup-optional engine-query bind-maps opt-patterns)
+      ;; Solve every connected OPTIONAL component with the left-hand bindings
+      ;; already available.  The former general path issued one independent,
+      ;; fully-variable engine query and only then left-joined it, turning a
+      ;; selective OPTIONAL into a dataset-wide scan.  `solve-component`
+      ;; substitutes up to `component-pushdown-limit` distinct join tuples;
+      ;; above that limit it deliberately falls back to one broad scan.
       (let [opt-vars (pattern-vars opt-patterns)
-            opt-rows (engine-query {:find opt-vars :where opt-patterns})]
+            components (connected-components opt-patterns)
+            matched (loop [rows bind-maps pending (vec components)]
+                      (if (or (empty? rows) (empty? pending))
+                        rows
+                        (let [bound (set (keys (first rows)))
+                              pick (pick-component bound pending)
+                              right (solve-component engine-query rows pick)]
+                          (recur (natural-join rows right)
+                                 (vec (remove #{pick} pending))))))
+            opt-rows (mapv #(mapv % opt-vars) matched)]
         (left-join bind-maps opt-vars opt-rows)))))
 
 (defn- comparable-value [s]
@@ -348,8 +388,10 @@
   (when aggregating) GROUP BY exactly the bare find vars -- the engine's
   implicit group-by is by the non-aggregate find columns, so a GROUP BY
   that differs must stay a post-pass."
-  [{:keys [optionals filters find group-by]}]
+  [{:keys [optionals filters find group-by distinct renames]}]
   (and (empty? optionals)
+       (not distinct)
+       (empty? renames)
        (every? #(#{:= :not=} (:op %)) filters)
        (every? (fn [item] (or (symbol? item) (#{:count :count-distinct} (:agg item)))) find)
        (let [aggregating? (some map? find)
