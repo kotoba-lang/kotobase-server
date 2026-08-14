@@ -44,8 +44,8 @@
 ;; DISTINCT query with the wrong rows and no error at all. A compiled query
 ;; naming something the executor cannot do must fail, not be approximated.
 (def ^:private known-keys
-  #{:find :where :unions :optionals :filters :group-by :order-by :limit
-    :paths :renames :distinct})
+  #{:find :where :unions :optionals :optional-paths :filters :group-by
+    :order-by :limit :paths :renames :distinct})
 
 (defn- assert-executable! [compiled]
   (let [unknown (remove known-keys (keys compiled))]
@@ -265,9 +265,11 @@
   Components are solved in an order that keeps them connected: a component is
   taken when it shares a variable with what is already bound, and a path is
   expanded as soon as its `:from` is bound."
-  [engine-query where paths adjacency]
-  (let [components (connected-components where)]
-    (loop [bind-maps [] pending (vec components) remaining-paths (vec paths)]
+  ([engine-query where paths adjacency]
+   (solve-base engine-query where paths adjacency []))
+  ([engine-query where paths adjacency seed-bind-maps]
+   (let [components (connected-components where)]
+    (loop [bind-maps (vec seed-bind-maps) pending (vec components) remaining-paths (vec paths)]
       (let [bound (if (seq bind-maps) (set (keys (first bind-maps))) #{})
             ready-path (first (filter #(contains? bound (:from %)) remaining-paths))]
         (cond
@@ -285,9 +287,16 @@
                 rows (solve-component engine-query bind-maps pick)]
             (recur (natural-join bind-maps rows)
                    (vec (remove #{pick} pending))
-                   remaining-paths)))))))
+                   remaining-paths))))))))
 
-(defn- optional-join [engine-query bind-maps opt-patterns]
+(defn- optional-vars [patterns paths]
+  (vec (distinct
+        (concat (pattern-vars patterns)
+                (mapcat (fn [{:keys [from to rel-var]}]
+                          (filter symbol? [from to rel-var]))
+                        paths)))))
+
+(defn- optional-join [engine-query bind-maps opt-patterns opt-paths adjacency]
   (cond
     ;; Nothing to left-join onto. The general path would still run the OPTIONAL
     ;; block as an independent query -- scanning the attribute across the whole
@@ -296,24 +305,14 @@
     ;; before returning the empty answer it already had.
     (empty? bind-maps) bind-maps
     :else
-    (if (bound-lookup-shape? bind-maps opt-patterns)
+    (if (and (empty? opt-paths) (bound-lookup-shape? bind-maps opt-patterns))
       (bound-lookup-optional engine-query bind-maps opt-patterns)
-      ;; Solve every connected OPTIONAL component with the left-hand bindings
-      ;; already available.  The former general path issued one independent,
-      ;; fully-variable engine query and only then left-joined it, turning a
-      ;; selective OPTIONAL into a dataset-wide scan.  `solve-component`
-      ;; substitutes up to `component-pushdown-limit` distinct join tuples;
-      ;; above that limit it deliberately falls back to one broad scan.
-      (let [opt-vars (pattern-vars opt-patterns)
-            components (connected-components opt-patterns)
-            matched (loop [rows bind-maps pending (vec components)]
-                      (if (or (empty? rows) (empty? pending))
-                        rows
-                        (let [bound (set (keys (first rows)))
-                              pick (pick-component bound pending)
-                              right (solve-component engine-query rows pick)]
-                          (recur (natural-join rows right)
-                                 (vec (remove #{pick} pending))))))
+      ;; Solve the complete OPTIONAL group with the left-hand bindings already
+      ;; available. `solve-base` interleaves path expansion and BGP components,
+      ;; so a variable-length path can bind a later component without producing
+      ;; a cross product. Only after that do we left-join and nil-fill misses.
+      (let [opt-vars (optional-vars opt-patterns opt-paths)
+            matched (solve-base engine-query opt-patterns opt-paths adjacency bind-maps)
             opt-rows (mapv #(mapv % opt-vars) matched)]
         (left-join bind-maps opt-vars opt-rows)))))
 
@@ -431,9 +430,9 @@
   the compiled query carries `:paths`. Absent, a `:paths` query fails rather
   than silently returning the zero-hop answer."
   ([engine-query compiled] (execute engine-query compiled nil))
-  ([engine-query {:keys [unions paths] :as compiled} adjacency]
+  ([engine-query {:keys [unions paths optional-paths] :as compiled} adjacency]
    (assert-executable! compiled)
-   (when (and (seq paths) (nil? adjacency))
+   (when (and (or (seq paths) (some seq optional-paths)) (nil? adjacency))
      (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
                      {:kotobase/error :adjacency-required})))
    (if (and (pushable? compiled) (empty? unions) (empty? paths))
@@ -441,8 +440,8 @@
      (execute-post-pass engine-query compiled adjacency))))
 
 (defn- execute-post-pass
-  [engine-query {:keys [find where unions optionals filters group-by order-by limit
-                        paths renames distinct]} adjacency]
+  [engine-query {:keys [find where unions optionals optional-paths filters group-by
+                        order-by limit paths renames distinct]} adjacency]
   (let [bind-maps
         (if (seq unions)
           (let [all-union-vars (vec (distinct (mapcat pattern-vars unions)))]
@@ -457,8 +456,11 @@
         bind-maps (if (seq unions)
                     (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
                     bind-maps)
-        bind-maps (reduce (fn [bms opt-patterns] (optional-join engine-query bms opt-patterns))
-                          bind-maps optionals)
+        bind-maps (reduce-kv
+                   (fn [bms idx opt-patterns]
+                     (optional-join engine-query bms opt-patterns
+                                    (get optional-paths idx []) adjacency))
+                   bind-maps (vec optionals))
         ;; Renames run AFTER the OPTIONAL projection blocks: `RETURN n.attr AS x`
         ;; is bound by one of those blocks, so renaming first copies a nil.
         bind-maps (reduce (fn [bms [from to]]

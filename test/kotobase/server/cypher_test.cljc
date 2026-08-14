@@ -91,7 +91,6 @@
                "OPTIONAL MATCH (a {x: 1}) RETURN a"                    ; MATCH で始まらない
                "MATCH (a {x: 1})-[:r]->(b) WITH b RETURN b"            ; WITH 未対応
                "MATCH (a {x: 1}) RETURN upper(a.x)"                    ; whitelist 外の関数
-               "MATCH (a {x: 1}) OPTIONAL MATCH (a)-[:r]-(b) RETURN a" ; OPTIONAL 内の無向
                "RETURN 1"]]
       (is (rejected? q) (str "loud reject されるべき: " q))))
   (testing "実装した形は受理される(過剰拒否になっていない)"
@@ -99,5 +98,6 @@
                "MATCH (a {x: 1})<-[:r]-(b {y: 2}) RETURN b"
                "MATCH (:Person {x: 1})-[:r]->(b) RETURN b"
                "MATCH (a {x: 1}) OPTIONAL MATCH (a)-[:r]->(b) RETURN a, b"
+               "MATCH (a {x: 1}) OPTIONAL MATCH (a)-[:r*1..3]-(b) RETURN a, b"
                "MATCH (a {x: 1}) RETURN coalesce(a.x, a.y)"]]
       (is (some? (parsed q)) (str "受理されるべき: " q)))))

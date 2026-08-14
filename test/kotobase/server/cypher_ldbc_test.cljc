@@ -161,10 +161,28 @@
     (is (= #{["1" "9"] ["2" nil] ["3" nil]}
            (rows-of (str "MATCH (n:Person) OPTIONAL MATCH (n)-[:isLocatedIn]->(c:City) "
                          "RETURN n.id, c.id")))))
-  (testing "an undirected or variable-length hop inside OPTIONAL is refused, not silently directed"
+  (testing "an undirected variable-length OPTIONAL expands from the left binding"
+    (is (= #{["1" "2"] ["1" "3"]}
+           (rows-of (str "MATCH (n:Person {id: \"1\"}) "
+                         "OPTIONAL MATCH (n)-[:knows*1..2]-(f:Person) "
+                         "RETURN n.id, f.id")))))
+  (testing "an OPTIONAL relationship variable is bound on matches"
+    (let [rows (:rows (run (str "MATCH (n:Person {id: \"1\"}) "
+                                "OPTIONAL MATCH (n)-[r:knows]-(f:Person) "
+                                "RETURN f.id, r")))]
+      (is (= [["2" ":knows|person-2"]] rows))))
+  (testing "a path miss preserves the left row and null-fills the optional side"
+    (is (= [["9" nil]]
+           (:rows (run (str "MATCH (n:City {id: \"9\"}) "
+                            "OPTIONAL MATCH (n)-[:knows*1..2]-(f) "
+                            "RETURN n.id, f.id"))))))
+  (testing "an OPTIONAL path still requires an adjacency implementation"
     (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
-                          #"OPTIONAL MATCH cannot contain"
-                          (cypher/parse "MATCH (n:Person) OPTIONAL MATCH (n)-[:knows]-(f) RETURN n.id")))))
+                          #"no adjacency fn"
+                          (qe/execute engine-query
+                                      (cypher/parse (str "MATCH (n:Person {id: \"1\"}) "
+                                                          "OPTIONAL MATCH (n)-[:knows]-(f) "
+                                                          "RETURN n.id, f.id")))))))
 
 (deftest coalesce-returns-the-first-non-null
   (testing "falls through to the second argument when the first is absent"

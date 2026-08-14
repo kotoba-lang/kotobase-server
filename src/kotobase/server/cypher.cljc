@@ -40,14 +40,15 @@
   query carrying a construct it cannot evaluate rather than approximating
   it.
 
-  OPTIONAL MATCH supports ordinary directed fixed-hop BGPs. Variable-length or
-  undirected relationships inside OPTIONAL are rejected; both are supported in
-  the primary MATCH. Anonymous nodes are accepted when the surrounding pattern
-  binds the query.
+  OPTIONAL MATCH supports ordinary BGPs plus directed, undirected and
+  variable-length relationships. Optional paths are kept separate from primary
+  paths in the compiled form so the executor can expand them under the left
+  join instead of accidentally making them mandatory. Anonymous nodes are
+  accepted when the surrounding pattern binds the query.
 
   Not supported (rejected): WITH, CASE and functions other than coalesce and
   toInteger, WHERE operators other than `=` `<>` `<` `<=` `>` `>=` joined by
-  AND, OR/NOT, OPTIONAL variable-length/undirected relationships, SKIP, and
+  AND, OR/NOT, SKIP, and
   every write form (CREATE/MERGE/DELETE/SET -- this surface is read-only)."
   (:require [clojure.string :as str]))
 
@@ -312,7 +313,8 @@
 
 (defn parse
   "Cypher subset text -> {:find [...] :where [[s p o] ...] :optionals [...]
-  :paths [...] :order-by :filters :group-by :distinct :limit}.
+  :optional-paths [...] :paths [...] :order-by :filters :group-by :distinct
+  :limit}.
   Throws ex-info {:cypher-subset true} on anything outside the subset.
 
   `params` supplies values for `$name` placeholders; a placeholder with no
@@ -331,8 +333,8 @@
                 [ts clauses paths])))
           ;; OPTIONAL MATCH -> one :optionals block per clause. The executor has
           ;; had left-join since the SPARQL work; only the parser was missing.
-          [ts match-optionals]
-          (loop [ts ts acc []]
+          [ts match-optionals match-optional-paths]
+          (loop [ts ts acc [] path-acc []]
             (if (and (kw? (first ts) "OPTIONAL") (kw? (second ts) "MATCH"))
               (let [[ts oc op]
                     (loop [ts (vec (drop 2 ts)) oc [] op []]
@@ -340,13 +342,11 @@
                         (if (= "," (first ts))
                           (recur (vec (rest ts)) oc op)
                           [ts oc op])))]
-                ;; A variable-length or undirected hop inside OPTIONAL would need
-                ;; path expansion under a left join, which the executor does not
-                ;; do. Reject rather than answer the directed single-hop version.
-                (when (seq op)
-                  (fail "OPTIONAL MATCH cannot contain a variable-length or undirected relationship" "OPTIONAL MATCH"))
-                (recur ts (conj acc (mapv vec oc))))
-              [ts acc]))
+                ;; Keep paths aligned with their OPTIONAL block. Folding them
+                ;; into primary :paths would make the relationship mandatory;
+                ;; dropping them would silently answer a one-hop query.
+                (recur ts (conj acc (mapv vec oc)) (conj path-acc (vec op))))
+              [ts acc path-acc]))
           [ts clauses filters]
           (if (kw? (first ts) "WHERE")
             (loop [ts (rest ts) clauses clauses filters []]
@@ -472,9 +472,17 @@
                     (into (mapcat (fn [{:keys [from to rel-var]}] (filter symbol? [from to rel-var])) paths))
                     ;; OPTIONAL MATCH binds too -- nullably, but bound.
                     (into (mapcat (fn [blk] (mapcat (fn [[s _ o]] (filter symbol? [s o])) blk))
-                                  match-optionals)))
+                                  match-optionals))
+                    (into (mapcat (fn [ps]
+                                    (mapcat (fn [{:keys [from to rel-var]}]
+                                              (filter symbol? [from to rel-var]))
+                                            ps))
+                                  match-optional-paths)))
           renames (filterv :rename projections)
-          optionals (into (vec match-optionals) (mapv :block (filterv :block projections)))
+          projection-optionals (mapv :block (filterv :block projections))
+          optionals (into (vec match-optionals) projection-optionals)
+          optional-paths (into (vec match-optional-paths)
+                               (repeat (count projection-optionals) []))
           projected (set (filter symbol? find-vars))
           agg-items (filterv :agg find-vars)
           fn-items (filterv :fn find-vars)
@@ -511,6 +519,7 @@
           (fail "ORDER BY var must be in RETURN" (str var))))
       (cond-> {:find (vec find-vars) :where (mapv vec clauses)}
         (seq optionals) (assoc :optionals optionals)
+        (some seq optional-paths) (assoc :optional-paths optional-paths)
         (seq renames) (assoc :renames (mapv (juxt :rename :as) renames))
         (seq paths) (assoc :paths paths)
         (seq order-by') (assoc :order-by order-by')
