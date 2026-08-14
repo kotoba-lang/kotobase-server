@@ -1124,6 +1124,46 @@
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
+(deftest cypher-handler-executes-primary-and-optional-paths
+  ;; Parser/executor tests supply adjacency directly. This handler-level test
+  ;; guards the production seam: do-cypher must derive adjacency from the hot
+  ;; db or every accepted path query fails only after deployment.
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gcp"
+                             :tx_edn (str "[{:db/id \"p1\" :label \"Person\" :id \"1\" :knows \"p2\"} "
+                                          "{:db/id \"p2\" :label \"Person\" :id \"2\" :knows \"p3\"} "
+                                          "{:db/id \"p3\" :label \"Person\" :id \"3\"} "
+                                          "{:db/id \"c9\" :label \"City\" :id \"9\"}]")}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gcp" :cypher q} nil))
+        primary "MATCH (a:Person {id: \"1\"})-[:knows*1..2]-(b:Person) RETURN b.id ORDER BY b.id"
+        optional (str "MATCH (a:Person {id: \"1\"}) "
+                      "OPTIONAL MATCH (a)-[:knows*1..2]-(b:Person) "
+                      "RETURN a.id, b.id ORDER BY b.id")
+        miss (str "MATCH (a:City {id: \"9\"}) "
+                  "OPTIONAL MATCH (a)-[:knows*1..2]-(b) RETURN a.id, b.id")]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn [] (is (= [["2"] ["3"]] (:rows (cy primary)))))
+         (fn [] (is (= [["1" "2"] ["1" "3"]] (:rows (cy optional)))))
+         (fn [] (is (= [["9" nil]] (:rows (cy miss)))))] )
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy primary)))
+             (.then (fn [r]
+                      (is (= [["2"] ["3"]] (:rows r)))
+                      (cy optional)))
+             (.then (fn [r]
+                      (is (= [["1" "2"] ["1" "3"]] (:rows r)))
+                      (cy miss)))
+             (.then (fn [r]
+                      (is (= [["9" nil]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
 (deftest sparql-depth-optional-filter-aggregates
   (let [store (mem-store)
         tx (fn [] (h/handle store "transact"
