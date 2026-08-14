@@ -75,7 +75,7 @@
   (:require #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])
             [datom.source :as src]
             [kotobase-peer.core :as eng]
-            [kotobase.datom-plan :as plan]))
+            [kotobase.server.datom-plan :as plan]))
 
 (defn- then*
   "The platform split, same as `kotobase.server.handler`'s: kotobase-peer's
