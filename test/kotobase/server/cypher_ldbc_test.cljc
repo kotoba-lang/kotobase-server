@@ -1,14 +1,13 @@
 (ns kotobase.server.cypher-ldbc-test
-  "End-to-end for the 2026-08-13 Cypher surface work: labels, parameters,
+  "End-to-end for the Cypher surface: labels, parameters,
   property projection, AS, ORDER BY on a projection, DISTINCT, undirected and
   right-to-left relationships, relationship variables, and variable-length
-  paths.
+  paths, boolean predicates, simple CASE, SKIP and a materializing WITH stage.
 
   Every test parses real Cypher and EXECUTES it against a tiny datom set, so a
   construct that parses but is dropped on the way to the answer fails here. The
   parse-only probe that preceded this work could not have caught that."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
             [kotobase.server.cypher :as cypher]
             [kotobase.server.query-exec :as qe]))
 
@@ -140,10 +139,8 @@
 
 (deftest still-rejects-what-is-still-outside-the-subset
   ;; 2026-08-13 second pass: coalesce is now implemented, so it moved out of this
-  ;; list and into its own execution test. WITH is still outside the subset.
-  (doseq [[label q] [["WITH"            "MATCH (a {id: \"1\"})-[:knows]->(b) WITH b RETURN b"]
-                     ["unknown function" "MATCH (a {id: \"1\"}) RETURN upper(a.x)"]
-                     ["SKIP"            "MATCH (a {id: \"1\"}) RETURN a SKIP 2"]]]
+  ;; list and into their own execution tests. Unknown functions stay loud.
+  (doseq [[label q] [["unknown function" "MATCH (a {id: \"1\"}) RETURN upper(a.x)"]]]
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
                  (cypher/parse q {}))
         (str label " must still be rejected loudly, not approximated"))))
@@ -208,6 +205,39 @@
 (deftest an-unknown-function-is-rejected-at-parse-time
   (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
                (cypher/parse "MATCH (n:Person {id: \"1\"}) RETURN upper(n.firstName)" {}))))
+
+(deftest boolean-where-expressions-preserve-three-valued-property-lookup
+  (testing "OR does not turn both property reads into mandatory joins"
+    (is (= #{["1"] ["3"]}
+           (rows-of (str "MATCH (n:Person) "
+                         "WHERE n.id = \"1\" OR n.firstName = \"Grace\" "
+                         "RETURN n.id")))))
+  (testing "NOT binds tighter than AND/OR and parentheses override precedence"
+    (is (= #{["3"]}
+           (rows-of (str "MATCH (n:Person) "
+                         "WHERE NOT (n.id = \"1\" OR n.id = \"2\") "
+                         "RETURN n.id"))))))
+
+(deftest skip-runs-after-ordering-and-before-limit
+  (is (= [["2"]]
+         (:rows (run "MATCH (n:Person) RETURN n.id ORDER BY n.id ASC SKIP 1 LIMIT 1")))))
+
+(deftest simple-case-executes-over-nullable-relationship-bindings
+  (is (= [[true]]
+         (:rows (run (str "MATCH (n:Person {id: \"1\"}) "
+                          "OPTIONAL MATCH (n)-[r:knows]->(f) "
+                          "RETURN CASE WHEN r IS NULL THEN false ELSE true END AS knows")))))
+  (is (= [[false]]
+         (:rows (run (str "MATCH (n:City {id: \"9\"}) "
+                          "OPTIONAL MATCH (n)-[r:knows]->(f) "
+                          "RETURN CASE WHEN r IS NULL THEN false ELSE true END AS knows"))))))
+
+(deftest with-materializes-an-ordered-bounded-stage-before-the-next-match
+  (let [q (str "MATCH (a:Person) "
+               "WITH a, a.id AS aid ORDER BY aid DESC SKIP 1 LIMIT 1 "
+               "MATCH (a)-[:knows]->(b) "
+               "RETURN aid, b.id")]
+    (is (= [["2" "3"]] (:rows (run q))))))
 
 ;; ---------------------------------------------------------------- IS6 shape
 

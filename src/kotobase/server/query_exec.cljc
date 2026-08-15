@@ -45,7 +45,7 @@
 ;; naming something the executor cannot do must fail, not be approximated.
 (def ^:private known-keys
   #{:find :where :unions :optionals :optional-paths :filters :group-by
-    :order-by :limit :paths :renames :distinct})
+    :order-by :skip :limit :paths :renames :distinct :predicate :pipeline})
 
 (defn- assert-executable! [compiled]
   (let [unknown (remove known-keys (keys compiled))]
@@ -73,6 +73,15 @@
                      #?(:clj (Long/parseLong (str v)) :cljs (js/parseInt (str v) 10))))
       (throw (ex-info (str "no implementation for RETURN function " fn)
                       {:kotobase/error :unimplemented-function :fn fn})))))
+
+(defn- apply-case [{:keys [subject when is-null then else]} bm]
+  (let [matches? (if is-null
+                   (nil? (get bm is-null))
+                   ;; In Cypher, null = null is null rather than true; simple
+                   ;; CASE therefore never selects a `WHEN null` branch.
+                   (let [actual (fn-arg bm subject)]
+                     (and (some? actual) (some? when) (= actual when))))]
+    (if matches? then else)))
 
 (defn- expand-path
   "One `:paths` entry against bind-maps. BFS from each already-bound `:from`
@@ -138,7 +147,7 @@
   inside the engine -- it was materialising every entity's `:id` to answer
   `RETURN p.id`. Property projection made this shape hot; before it, an OPTIONAL
   block was rare and usually genuinely unbound."
-  [engine-query bind-maps [[s p o] :as patterns]]
+  [engine-query bind-maps [[s p o]]]
   (let [subjects (into #{} (keep #(get % s)) bind-maps)
         rows (into {} (mapcat (fn [subj]
                                 (map (fn [[v]] [[subj v] true])
@@ -268,8 +277,17 @@
   ([engine-query where paths adjacency]
    (solve-base engine-query where paths adjacency []))
   ([engine-query where paths adjacency seed-bind-maps]
-   (let [components (connected-components where)]
-    (loop [bind-maps (vec seed-bind-maps) pending (vec components) remaining-paths (vec paths)]
+   ;; A path-free BGP belongs in one engine query. kotobase-peer's query
+   ;; planner measures visible clause cardinalities (or consumes fresh scoped
+   ;; materialized statistics), cost-orders the clauses, and forwards those
+   ;; estimates to the join strategy. Splitting disconnected components here
+   ;; used to hide the whole BGP from that planner and replace its statistics
+   ;; with this layer's literal-count heuristic.
+   (if (and (empty? paths) (empty? seed-bind-maps))
+     (let [vars (pattern-vars where)]
+       (rows->maps vars (engine-query {:find vars :where where})))
+     (let [components (connected-components where)]
+      (loop [bind-maps (vec seed-bind-maps) pending (vec components) remaining-paths (vec paths)]
       (let [bound (if (seq bind-maps) (set (keys (first bind-maps))) #{})
             ready-path (first (filter #(contains? bound (:from %)) remaining-paths))]
         (cond
@@ -287,7 +305,7 @@
                 rows (solve-component engine-query bind-maps pick)]
             (recur (natural-join bind-maps rows)
                    (vec (remove #{pick} pending))
-                   remaining-paths))))))))
+                   remaining-paths)))))))))
 
 (defn- optional-vars [patterns paths]
   (vec (distinct
@@ -340,6 +358,14 @@
           (case op := (zero? c) :not= (not (zero? c))
                 :< (neg? c) :<= (not (pos? c)) :> (pos? c) :>= (not (neg? c))))))))
 
+(defn- predicate-value [bm {:keys [op var cmp value args arg]}]
+  (case op
+    :cmp ((filter-pred {:var var :op cmp :value value}) bm)
+    :and (every? #(predicate-value bm %) args)
+    :or (boolean (some #(predicate-value bm %) args))
+    :not (not (predicate-value bm arg))
+    false))
+
 (defn- agg-fold [{:keys [agg var]} bms]
   (let [vals (keep #(get % var) bms)
         nums (keep #(let [v (comparable-value %)] (when (number? v) v)) vals)]
@@ -350,7 +376,7 @@
       :max (when (seq nums) (reduce max nums))
       :avg (when (seq nums) (/ (reduce + 0.0 nums) (count nums))))))
 
-(defn- order-and-limit [rows find-keys order-by limit]
+(defn- order-and-limit [rows find-keys order-by skip limit]
   (let [rows
         (if (seq order-by)
           (let [idx-of (fn [v] (let [i (.indexOf find-keys v)]
@@ -379,7 +405,10 @@
                             (if (zero? c) (recur (inc n) ) c)))))]
             (vec (sort-by keyfn cmp rows)))
           (vec rows))]
-    (if limit (vec (take limit rows)) rows)))
+    (cond->> rows
+      skip (drop skip)
+      limit (take limit)
+      true vec)))
 
 (defn- pushable?
   "True iff the whole query can be answered by ONE engine query: no
@@ -387,8 +416,9 @@
   (when aggregating) GROUP BY exactly the bare find vars -- the engine's
   implicit group-by is by the non-aggregate find columns, so a GROUP BY
   that differs must stay a post-pass."
-  [{:keys [optionals filters find group-by distinct renames]}]
+  [{:keys [optionals filters find group-by distinct renames predicate]}]
   (and (empty? optionals)
+       (nil? predicate)
        (not distinct)
        (empty? renames)
        (every? #(#{:= :not=} (:op %)) filters)
@@ -413,12 +443,12 @@
   "Single-engine-query path (see `pushable?`). Aggregates + =/!= filters go
   INTO the engine query; only ORDER BY / LIMIT remain as a post-pass over
   the (already grouped/counted) result."
-  [engine-query {:keys [find where filters order-by limit]}]
+  [engine-query {:keys [find where filters order-by skip limit]}]
   (let [engine-find (mapv find->engine-find find)
         clauses (into (vec where) (map filter->clause filters))
         rows (engine-query {:find engine-find :where clauses})
         find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
-        rows (order-and-limit rows find-keys order-by limit)]
+        rows (order-and-limit rows find-keys order-by skip limit)]
     {:vars (mapv str find-keys) :rows rows}))
 
 (defn execute
@@ -432,16 +462,30 @@
   ([engine-query compiled] (execute engine-query compiled nil))
   ([engine-query {:keys [unions paths optional-paths] :as compiled} adjacency]
    (assert-executable! compiled)
-   (when (and (or (seq paths) (some seq optional-paths)) (nil? adjacency))
-     (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
-                     {:kotobase/error :adjacency-required})))
-   (if (and (pushable? compiled) (empty? unions) (empty? paths))
-     (execute-pushed engine-query compiled)
-     (execute-post-pass engine-query compiled adjacency))))
+   (if-let [[first-stage second-stage] (:pipeline compiled)]
+     (let [first-result (execute engine-query first-stage adjacency)
+           first-keys (mapv (fn [item] (if (map? item) (:as item) item))
+                            (:find first-stage))
+           seeds (rows->maps first-keys (:rows first-result))]
+       (when (and (or (seq (:paths second-stage))
+                      (some seq (:optional-paths second-stage)))
+                  (nil? adjacency))
+         (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
+                         {:kotobase/error :adjacency-required})))
+       (execute-post-pass engine-query second-stage adjacency seeds))
+     (do
+       (when (and (or (seq paths) (some seq optional-paths)) (nil? adjacency))
+         (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
+                         {:kotobase/error :adjacency-required})))
+       (if (and (pushable? compiled) (empty? unions) (empty? paths))
+         (execute-pushed engine-query compiled)
+         (execute-post-pass engine-query compiled adjacency))))))
 
 (defn- execute-post-pass
-  [engine-query {:keys [find where unions optionals optional-paths filters group-by
-                        order-by limit paths renames distinct]} adjacency]
+  ([engine-query compiled adjacency]
+   (execute-post-pass engine-query compiled adjacency []))
+  ([engine-query {:keys [find where unions optionals optional-paths filters group-by
+                         order-by skip limit paths renames distinct predicate]} adjacency seed-bind-maps]
   (let [bind-maps
         (if (seq unions)
           (let [all-union-vars (vec (distinct (mapcat pattern-vars unions)))]
@@ -450,7 +494,7 @@
                                  nil-fill (zipmap (remove (set bvars) all-union-vars) (repeat nil))]
                              (map #(merge nil-fill %) (rows->maps bvars (engine-query {:find bvars :where branch})))))
                          unions)))
-          (solve-base engine-query where paths adjacency))
+          (solve-base engine-query where paths adjacency seed-bind-maps))
         ;; A union branch still expands its paths afterwards; only the plain
         ;; BGP path gets the interleaved treatment.
         bind-maps (if (seq unions)
@@ -467,11 +511,15 @@
                             (mapv (fn [bm] (assoc bm to (get bm from))) bms))
                           bind-maps (or renames []))
         bind-maps (reduce (fn [bms f] (filterv (filter-pred f) bms)) bind-maps filters)
+        bind-maps (if predicate (filterv #(predicate-value % predicate) bind-maps) bind-maps)
+        bind-maps (reduce (fn [bms item]
+                            (mapv (fn [bm] (assoc bm (:as item) (apply-case (:case item) bm))) bms))
+                          bind-maps (filterv :case find))
         ;; Whitelisted scalar functions, computed per row before projection.
         bind-maps (reduce (fn [bms item]
                             (mapv (fn [bm] (assoc bm (:as item) (apply-fn item bm))) bms))
                           bind-maps (filterv :fn find))
-        find (mapv (fn [item] (if (:fn item) (:as item) item)) find)
+        find (mapv (fn [item] (if (or (:fn item) (:case item)) (:as item) item)) find)
         aggregate? (some :agg find)
         rows
         (cond
@@ -489,6 +537,6 @@
           :else (mapv (fn [bm] (mapv #(get bm %) find)) bind-maps))
         rows (if distinct (vec (clojure.core/distinct rows)) rows)
         find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
-        rows (order-and-limit rows find-keys order-by limit)]
+        rows (order-and-limit rows find-keys order-by skip limit)]
     {:vars (mapv str find-keys)
-     :rows rows}))
+     :rows rows})))

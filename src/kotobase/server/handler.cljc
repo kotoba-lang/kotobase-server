@@ -826,15 +826,20 @@
   [store body]
   (spp/do-sparql store body (visible-of store)))
 
+(defn- cypher-create-entity [{:keys [id properties]}]
+  (reduce-kv (fn [entity attr value]
+               (assoc entity (keyword (str/replace-first attr #"^:" "")) value))
+             {:db/id id} properties))
+
 (defn do-cypher
-  "`graph.query` -- CYPHER BASIC SUBSET over the same hot db `do-q` uses.
-  body: {:graph :cypher}. `kotobase.server.cypher/parse` compiles
-  MATCH/WHERE/RETURN basic patterns to the exact map-form Datalog `do-q`
-  executes; anything outside the subset returns {:ok false :error
+  "`graph.query` -- bounded Cypher subset over the same persisted graph used
+  by `do-q`. body: {:graph :cypher}. Reads compile MATCH/WHERE/WITH/RETURN to
+  the shared graph executor. Authenticated standalone-node CREATE reuses
+  `do-transact`, including graph policy checks and conditional head CAS.
+  Anything outside the subset returns {:ok false :error
   \"UnsupportedCypher\"} with the supported grammar in :message -- the
-  same loudly-rejected-approximation doctrine as `do-sparql`, which this
-  mirrors exactly (parse ns differs, executor identical)."
-  [store {:keys [graph cypher]}]
+  same loudly-rejected-approximation doctrine as `do-sparql`."
+  [store {:keys [graph cypher]} auth]
   (let [parsed (try (cypher/parse cypher)
                     (catch #?(:clj Exception :cljs :default) e
                       (if (:cypher-subset (ex-data e))
@@ -842,7 +847,23 @@
                         (throw e))))]
     (if-some [msg (::unsupported parsed)]
       {:ok false :error "UnsupportedCypher" :message msg}
-      (run-compiled-graph-query store graph parsed))))
+      (if (= :create (:write parsed))
+        (let [auth-did (if (map? auth) (:did auth) auth)]
+          (if (str/blank? (str auth-did))
+            {:ok false :error "AccessDenied" :reason "Cypher writes require verified authorization"}
+            (let [entities (mapv cypher-create-entity (:nodes parsed))]
+              (then* (do-transact store {:graph graph :tx_edn (pr-str entities)} auth)
+                     (fn [result]
+                       (if-not (:ok result)
+                         result
+                         (let [by-var (into {} (map (juxt :variable :id) (:nodes parsed)))
+                               return-vars (:return parsed)]
+                           (cond-> (assoc result :language "cypher" :write "CREATE"
+                                                 :created (mapv :id (:nodes parsed)))
+                             (seq return-vars)
+                             (assoc :vars (mapv str return-vars)
+                                    :rows [(mapv by-var return-vars)])))))))))
+        (run-compiled-graph-query store graph parsed)))))
 
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
@@ -1368,14 +1389,13 @@
                        :message #?(:clj (.getMessage ^Exception e)
                                    :cljs (or (ex-message e) (.-message e)))})))
           (dispatch [store]
-            (let [auth-did (if (map? auth) (:did auth) auth)]
-              (case method
+            (case method
                 "datoms"      (do-datoms store body)
                 "transact"    (do-transact store body auth)
                 "with"        (do-with store body)
                 "q"           (do-q store body)
                 "sparql"      (do-sparql store body)
-                "cypher"      (do-cypher store body)
+                "cypher"      (do-cypher store body auth)
                 "pull"        (do-pull store body)
                 "pullMany"    (do-pull-many store body)
                 "indexPull"   (do-index-pull store body)
@@ -1397,7 +1417,7 @@
                 "sync"        (do-sync store body)
                 "kg.ingest"       (do-kg-ingest store body auth)
                 "kg.ingest_batch" (do-kg-ingest-batch store body auth)
-                {:ok false :error "MethodNotImplemented" :method method})))]
+                {:ok false :error "MethodNotImplemented" :method method}))]
     (try
       ;; ADR-2607174500 Phase 3b: resolve (graph policy × viewer caps) into
       ;; the per-request visible? BEFORE dispatch for redaction-relevant
