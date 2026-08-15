@@ -100,16 +100,17 @@
                         [?friend ":name" ?name]] (:where %)) @queries)
         "it does not issue the former dataset-wide OPTIONAL scan")))
 
-(deftest planner-starts-with-the-most-selective-disconnected-component
+(deftest path-free-bgp-is-delegated-whole-to-the-statistics-planner
   (let [queries (atom [])
         eng (fn [q] (swap! queries conj q) [])]
     (qx/execute eng {:find '[?e]
                      :where '[[?e ":broad" ?v]
                               [?seed ":id" "fixed-id"]]
                      :distinct true})
-    (is (= '[[?seed ":id" "fixed-id"]]
+    (is (= '[[?e ":broad" ?v]
+             [?seed ":id" "fixed-id"]]
            (:where (first @queries)))
-        "literal-bearing component is planned before an unrelated broad scan")))
+        "the engine sees every component and can cost-order them from visible/materialized cardinalities")))
 
 (deftest distinct-never-enters-the-pushdown-path-that-ignores-it
   (let [queries (atom [])

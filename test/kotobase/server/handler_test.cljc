@@ -1164,6 +1164,44 @@
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
+(deftest cypher-create-reuses-the-authorized-transaction-path
+  (let [store (mem-store)
+        create-q "CREATE (n:Person {id: \"cp1\", name: \"Ada\"}) RETURN n"
+        create! #(h/handle store "cypher" {:graph "gcw" :cypher create-q}
+                           "did:key:ztest")
+        read! #(h/handle store "cypher"
+                         {:graph "gcw"
+                          :cypher "MATCH (n:Person {id: \"cp1\"}) RETURN n.name"}
+                         nil)]
+    #?(:clj
+       (run-steps
+        [(fn []
+           (let [denied (h/handle store "cypher" {:graph "gcw" :cypher create-q} nil)]
+             (is (= "AccessDenied" (:error denied)))))
+         (fn []
+           (let [created (create!)]
+             (is (:ok created))
+             (is (= "CREATE" (:write created)))
+             (is (= ["cp1"] (:created created)))
+             (is (= [["cp1"]] (:rows created)))))
+         (fn [] (is (= [["Ada"]] (:rows (read!)))))])
+       :cljs
+       (async done
+         (-> (h/handle store "cypher" {:graph "gcw" :cypher create-q} nil)
+             (.then (fn [denied]
+                      (is (= "AccessDenied" (:error denied)))
+                      (create!)))
+             (.then (fn [created]
+                      (is (:ok created))
+                      (is (= "CREATE" (:write created)))
+                      (is (= ["cp1"] (:created created)))
+                      (is (= [["cp1"]] (:rows created)))
+                      (read!)))
+             (.then (fn [read]
+                      (is (= [["Ada"]] (:rows read)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
 (deftest sparql-depth-optional-filter-aggregates
   (let [store (mem-store)
         tx (fn [] (h/handle store "transact"

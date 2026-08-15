@@ -9,9 +9,13 @@
 
     MATCH p1, p2, ...
     [OPTIONAL MATCH p1, p2, ...] ...
-    [WHERE v.attr = lit AND v.attr = lit ...]
+    [WHERE boolean-expression]
     RETURN [DISTINCT] item, ...
-    [ORDER BY item [ASC|DESC], ...] [LIMIT n]
+    [ORDER BY item [ASC|DESC], ...] [SKIP n] [LIMIT n]
+
+  One materializing WITH stage followed by MATCH is supported. WITH may use
+  the same projection/order/skip/limit shape as RETURN. Boolean expressions
+  support parentheses and NOT/AND/OR with precedence NOT > AND > OR.
 
     pattern := (v [:Label]* [{attr: lit, ...}]) chained by relationships
     rel     := -[[relvar] :attr [*range]]->   left to right
@@ -21,7 +25,19 @@
     item    := v | v.attr [AS alias] | agg(v) [AS alias]
              | coalesce(item, ...) [AS alias]
              | toInteger(item) [AS alias]
-    lit     := \"string\" | 'string' | integer | decimal | $param
+             | CASE v WHEN lit THEN lit ELSE lit END [AS alias]
+             | CASE WHEN v IS NULL THEN lit ELSE lit END [AS alias]
+    lit     := null | true | false | \"string\" | 'string'
+             | integer | decimal | $param
+
+  The write subset is deliberately narrower than the read subset:
+
+    CREATE (v[:Label] {id: lit, property: lit, ...}) [, ...]
+    [RETURN v [, ...]]
+
+  It creates standalone nodes only, requires a non-empty id, and is executed
+  through the same authorization, policy, append-only commit and conditional
+  head-CAS path as datom transactions.
 
   Attribute names are used as stored: a rel type `[:sp/knows]` matches the
   stored attribute string \":sp/knows\"; a property key `sp/name:` is
@@ -46,14 +62,15 @@
   join instead of accidentally making them mandatory. Anonymous nodes are
   accepted when the surrounding pattern binds the query.
 
-  Not supported (rejected): WITH, CASE and functions other than coalesce and
-  toInteger, WHERE operators other than `=` `<>` `<` `<=` `>` `>=` joined by
-  AND, OR/NOT, SKIP, and
-  every write form (CREATE/MERGE/DELETE/SET -- this surface is read-only)."
+  Not supported (rejected): multiple WITH stages, searched CASE forms other
+  than `WHEN v IS NULL`, CASE result expressions beyond literals, functions
+  other than coalesce/toInteger,
+  relationship CREATE, CREATE from MATCH, MERGE, DELETE, SET, REMOVE and every
+  other write form outside the bounded standalone-node CREATE above."
   (:require [clojure.string :as str]))
 
 (def grammar-help
-  "supported: MATCH (a)-[:attr]->(b), (c {attr: \"v\"}) [WHERE a.attr = lit AND ...] RETURN a, b [LIMIT n]")
+  "supported: MATCH/OPTIONAL MATCH, boolean WHERE (= <> < <= > >=, NOT/AND/OR), one WITH ... MATCH stage, RETURN projections/simple CASE, ORDER BY/SKIP/LIMIT; or authenticated standalone-node CREATE (... {id: lit}) [RETURN v]")
 
 (defn- fail [msg near]
   (throw (ex-info (str "cypher-subset: " msg " (near: " (pr-str near) "). " grammar-help)
@@ -111,12 +128,16 @@
 
 (defn- literal? [t]
   (or (str/starts-with? t "\"") (str/starts-with? t "'")
-      (re-matches #"-?[0-9]+(?:\.[0-9]+)?" t)))
+      (re-matches #"-?[0-9]+(?:\.[0-9]+)?" t)
+      (contains? #{"NULL" "TRUE" "FALSE"} (str/upper-case (str t)))))
 
 (defn- literal->value [t]
   (cond
     (str/starts-with? t "\"") (subs t 1 (dec (count t)))
     (str/starts-with? t "'") (subs t 1 (dec (count t)))
+    (= "NULL" (str/upper-case (str t))) nil
+    (= "TRUE" (str/upper-case (str t))) true
+    (= "FALSE" (str/upper-case (str t))) false
     :else t))
 
 (defn- attr-name [t] (if (str/starts-with? t ":") t (str ":" t)))
@@ -129,9 +150,9 @@
 (defn- parse-int [t]
   #?(:clj (Long/parseLong (str t)) :cljs (js/parseInt (str t) 10)))
 
-(defn- ident? [t] (boolean (and t (re-matches #"[A-Za-z_][A-Za-z0-9_/\-]*" t))))
+(defn- token-ident? [t] (boolean (and t (re-matches #"[A-Za-z_][A-Za-z0-9_/\-]*" t))))
 
-(defn- kw? [t kw] (and (ident? t) (= (str/upper-case t) kw)))
+(defn- kw? [t kw] (and (token-ident? t) (= (str/upper-case t) kw)))
 
 (def ^:private where-ops {"=" := "<>" :not= "<" :< "<=" :<= ">" :> ">=" :>=})
 (def ^:private return-aggs #{"count" "sum" "min" "max" "avg"})
@@ -144,7 +165,7 @@
   [ts v clauses]
   (loop [ts ts clauses clauses]
     (let [[k colon lit & more] ts]
-      (when-not (ident? k) (fail "property key expected" k))
+      (when-not (token-ident? k) (fail "property key expected" k))
       (when-not (= ":" colon) (fail "property key needs ':'" k))
       (when-not (and lit (literal? lit)) (fail "property value must be a literal" lit))
       (let [clauses (conj clauses [v (attr-name k) (literal->value lit)])]
@@ -162,7 +183,7 @@
   tokenizer's catch-all exists to prevent."
   [ts v clauses]
   (loop [ts ts clauses clauses]
-    (if (and (= ":" (first ts)) (ident? (second ts)))
+    (if (and (= ":" (first ts)) (token-ident? (second ts)))
       (recur (drop 2 ts) (conj clauses [v ":label" (second ts)]))
       [(vec ts) clauses])))
 
@@ -174,10 +195,10 @@
     ;; `(:Label {..})` and `()` -- LDBC IS2 opens with one. The variable is
     ;; generated rather than the node being skipped: an unnamed node still
     ;; constrains the pattern, and dropping it would widen the match.
-    (let [anon? (not (ident? v))
+    (let [anon? (not (token-ident? v))
           more (if anon? (cons v more) more)
           v (if anon? (anon-name) v)]
-      (when-not (or anon? (ident? v)) (fail "node needs a variable name" v))
+      (when-not (or anon? (token-ident? v)) (fail "node needs a variable name" v))
     (let [sym (symbol (str "?" v))
           before (count clauses)
           [more clauses] (parse-labels more sym clauses)
@@ -196,12 +217,12 @@
   "Inside `[ ... ]`: [relvar] ':' attr ['*' [min] ['..' [max]]]
   -> {:rel-var ?r|nil :attr \":a\" :min n :max n|nil}."
   [ts]
-  (let [[rel-var ts] (if (and (ident? (first ts)) (= ":" (second ts)))
+  (let [[rel-var ts] (if (and (token-ident? (first ts)) (= ":" (second ts)))
                        [(symbol (str "?" (first ts))) (vec (rest ts))]
                        [nil (vec ts)])]
     (when-not (= ":" (first ts)) (fail "relationship needs [:attr]" (first ts)))
     (let [attr (second ts)]
-      (when-not (ident? attr) (fail "relationship type expected after [:" attr))
+      (when-not (token-ident? attr) (fail "relationship type expected after [:" attr))
       (let [ts (vec (drop 2 ts))]
         (if (= "*" (first ts))
           ;; `*`, `*n`, `*n..`, `*n..m`, `*..m`
@@ -288,7 +309,7 @@
   (let [fname (keyword (str/lower-case (first ts)))]
     (loop [ts (vec (drop 2 ts)) args [] projs projs]
       (cond
-        (and (ident? (first ts)) (= "." (second ts)) (ident? (nth ts 2 nil)))
+        (and (token-ident? (first ts)) (= "." (second ts)) (token-ident? (nth ts 2 nil)))
         (let [v (first ts) k (nth ts 2)
               pv (projection-var v k)]
           (recur (vec (drop 3 ts)) (conj args pv)
@@ -296,12 +317,12 @@
         (= "," (first ts)) (recur (vec (rest ts)) args projs)
         (literal? (first ts))
         (recur (vec (rest ts)) (conj args [:lit (literal->value (first ts))]) projs)
-        (and (ident? (first ts)) (not= "(" (second ts)))
+        (and (token-ident? (first ts)) (not= "(" (second ts)))
         (recur (vec (rest ts)) (conj args (symbol (str "?" (first ts)))) projs)
         (= ")" (first ts))
         (let [more (vec (rest ts))
               [alias more] (if (kw? (first more) "AS")
-                             (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                             (do (when-not (token-ident? (second more)) (fail "AS needs an alias name" (second more)))
                                  [(symbol (str "?" (second more))) (vec (drop 2 more))])
                              [(symbol (str "?" (name fname) "_" ordinal)) more])]
           (when (empty? args) (fail "function call needs at least one argument" (name fname)))
@@ -310,8 +331,115 @@
           [more {:fn fname :args args :as alias} projs])
         :else (fail "unsupported function argument" (first ts))))))
 
+(declare parse-where-or)
 
-(defn parse
+(defn- parse-where-primary [ts]
+  (cond
+    (= "(" (first ts))
+    (let [[more expr blocks] (parse-where-or (vec (rest ts)))]
+      (when-not (= ")" (first more)) (fail "WHERE expression must close with )" (first more)))
+      [(vec (rest more)) expr blocks])
+
+    (and (token-ident? (first ts)) (= "." (second ts)) (token-ident? (nth ts 2 nil)))
+    (let [[v _ k cmp lit & more] ts]
+      (when-not (contains? where-ops cmp)
+        (fail "unsupported WHERE comparison (=, <>, <, <=, >, >=)" cmp))
+      (when-not (literal? lit) (fail "WHERE value must be a literal" lit))
+      (let [pv (projection-var v k)]
+        [(vec more)
+         {:op :cmp :var pv :cmp (get where-ops cmp) :value (literal->value lit)}
+         [[[ (symbol (str "?" v)) (attr-name k) pv]]]]))
+
+    :else (fail "WHERE needs a comparison, NOT, or parenthesized expression" (first ts))))
+
+(defn- parse-where-not [ts]
+  (if (kw? (first ts) "NOT")
+    (let [[more expr blocks] (parse-where-not (vec (rest ts)))]
+      [more {:op :not :arg expr} blocks])
+    (parse-where-primary ts)))
+
+(defn- parse-where-and [ts]
+  (let [[ts first-expr first-blocks] (parse-where-not ts)]
+    (loop [ts ts args [first-expr] blocks first-blocks]
+      (if (kw? (first ts) "AND")
+        (let [[more expr more-blocks] (parse-where-not (vec (rest ts)))]
+          (recur more (conj args expr) (into blocks more-blocks)))
+        [ts (if (= 1 (count args)) (first args) {:op :and :args args}) blocks]))))
+
+(defn- parse-where-or [ts]
+  (let [[ts first-expr first-blocks] (parse-where-and ts)]
+    (loop [ts ts args [first-expr] blocks first-blocks]
+      (if (kw? (first ts) "OR")
+        (let [[more expr more-blocks] (parse-where-and (vec (rest ts)))]
+          (recur more (conj args expr) (into blocks more-blocks)))
+        [ts (if (= 1 (count args)) (first args) {:op :or :args args}) blocks]))))
+
+(defn- parse-case-item [ts ordinal]
+  (let [[case more]
+        (if (kw? (second ts) "WHEN")
+          (let [[_ _ subject is-kw null-kw then-kw then-value
+                 else-kw else-value end-kw & more] ts]
+            (when-not (token-ident? subject) (fail "CASE WHEN subject must be a bound variable" subject))
+            (when-not (and (kw? is-kw "IS") (kw? null-kw "NULL"))
+              (fail "searched CASE currently supports WHEN variable IS NULL" is-kw))
+            (when-not (kw? then-kw "THEN") (fail "CASE needs THEN" then-kw))
+            (when-not (literal? then-value) (fail "CASE THEN value must be a literal" then-value))
+            (when-not (kw? else-kw "ELSE") (fail "CASE needs ELSE" else-kw))
+            (when-not (literal? else-value) (fail "CASE ELSE value must be a literal" else-value))
+            (when-not (kw? end-kw "END") (fail "CASE must close with END" end-kw))
+            [{:is-null (symbol (str "?" subject))
+              :then (literal->value then-value)
+              :else (literal->value else-value)} more])
+          (let [[_ subject when-kw when-value then-kw then-value
+                 else-kw else-value end-kw & more] ts]
+            (when-not (token-ident? subject) (fail "CASE subject must be a bound variable" subject))
+            (when-not (kw? when-kw "WHEN") (fail "CASE needs WHEN" when-kw))
+            (when-not (literal? when-value) (fail "CASE WHEN value must be a literal" when-value))
+            (when-not (kw? then-kw "THEN") (fail "CASE needs THEN" then-kw))
+            (when-not (literal? then-value) (fail "CASE THEN value must be a literal" then-value))
+            (when-not (kw? else-kw "ELSE") (fail "CASE needs ELSE" else-kw))
+            (when-not (literal? else-value) (fail "CASE ELSE value must be a literal" else-value))
+            (when-not (kw? end-kw "END") (fail "CASE must close with END" end-kw))
+            [{:subject (symbol (str "?" subject))
+              :when (literal->value when-value)
+              :then (literal->value then-value)
+              :else (literal->value else-value)} more]))
+        [alias more] (if (kw? (first more) "AS")
+                       (do (when-not (token-ident? (second more))
+                             (fail "AS needs an alias name" (second more)))
+                           [(symbol (str "?" (second more))) (vec (drop 2 more))])
+                       [(symbol (str "?case_" ordinal)) (vec more)])]
+    [more {:case case :as alias}]))
+
+(defn- parse-create [text params]
+  (let [ts (substitute-params (tokenize (str text)) params)]
+    (when-not (kw? (first ts) "CREATE") (fail "write must start with CREATE" (first ts)))
+    (loop [ts (vec (rest ts)) nodes []]
+      (let [[more clauses paths] (parse-one-pattern ts [] [])
+            sym (ffirst clauses)]
+        (when (or (seq paths)
+                  (some (fn [[s _ o]] (or (not= s sym) (symbol? o))) clauses))
+          (fail "CREATE currently supports standalone nodes, not relationships" (first more)))
+        (let [properties (into {} (map (fn [[_ attr value]] [attr value]) clauses))
+              entity-id (get properties ":id")]
+          (when (or (nil? entity-id) (str/blank? (str entity-id)))
+            (fail "CREATE node requires a non-empty id property" (str sym)))
+          (let [nodes (conj nodes {:variable sym :id (str entity-id)
+                                   :properties properties})]
+            (cond
+              (= "," (first more)) (recur (vec (rest more)) nodes)
+              (empty? more) {:write :create :nodes nodes}
+              (kw? (first more) "RETURN")
+              (let [return-vars (->> (rest more) (remove #{","})
+                                     (mapv #(symbol (str "?" %))))
+                    created-vars (set (map :variable nodes))]
+                (when (or (empty? return-vars)
+                          (some #(not (contains? created-vars %)) return-vars))
+                  (fail "CREATE RETURN may name only created node variables" (first more)))
+                {:write :create :nodes nodes :return return-vars})
+              :else (fail "CREATE allows another node or RETURN" (first more)))))))))
+
+(defn- parse-basic
   "Cypher subset text -> {:find [...] :where [[s p o] ...] :optionals [...]
   :optional-paths [...] :paths [...] :order-by :filters :group-by :distinct
   :limit}.
@@ -319,8 +447,8 @@
 
   `params` supplies values for `$name` placeholders; a placeholder with no
   value is a failure, never an empty match."
-  ([text] (parse text nil))
-  ([text params]
+  ([text params] (parse-basic text params #{}))
+  ([text params initial-bound]
    (binding [*anon* (atom 0)]
     (let [ts (substitute-params (tokenize (str text)) params)]
     (when (empty? ts) (fail "empty query" ""))
@@ -347,25 +475,11 @@
                 ;; dropping them would silently answer a one-hop query.
                 (recur ts (conj acc (mapv vec oc)) (conj path-acc (vec op))))
               [ts acc path-acc]))
-          [ts clauses filters]
+          [ts clauses filters predicate predicate-optionals]
           (if (kw? (first ts) "WHERE")
-            (loop [ts (rest ts) clauses clauses filters []]
-              (let [[v dot k op lit & more] ts]
-                (when-not (ident? v) (fail "WHERE needs var.attr op literal" v))
-                (when-not (= "." dot) (fail "WHERE needs var.attr" dot))
-                (when-not (ident? k) (fail "WHERE attribute expected" k))
-                (when-not (contains? where-ops op) (fail "unsupported WHERE operator (=, <>, <, <=, >, >= )" op))
-                (when-not (and lit (literal? lit)) (fail "WHERE value must be a literal" lit))
-                (let [[clauses filters]
-                      (if (= "=" op)
-                        [(conj clauses [(symbol (str "?" v)) (attr-name k) (literal->value lit)]) filters]
-                        (let [fv (symbol (str "?" v "__" (str/replace k "/" "_")))]
-                          [(conj clauses [(symbol (str "?" v)) (attr-name k) fv])
-                           (conj filters {:var fv :op (get where-ops op) :value (literal->value lit)})]))]
-                  (if (kw? (first more) "AND")
-                    (recur (rest more) clauses filters)
-                    [more clauses filters]))))
-            [ts clauses []])
+            (let [[more expr blocks] (parse-where-or (vec (rest ts)))]
+              [more clauses [] expr (vec (distinct blocks))])
+            [ts clauses [] nil []])
           _ (when-not (kw? (first ts) "RETURN") (fail "RETURN required" (first ts)))
           ts (vec (rest ts))
           [distinct? ts] (if (kw? (first ts) "DISTINCT") [true (vec (rest ts))] [false ts])
@@ -376,13 +490,20 @@
           [ts find-vars projections]
           (loop [ts ts acc [] projs []]
             (cond
-              (and (ident? (first ts)) (contains? return-aggs (str/lower-case (first ts)))
+              (kw? (first ts) "CASE")
+              (let [[more item] (parse-case-item ts (count acc))
+                    acc (conj acc item)]
+                (if (= "," (first more))
+                  (recur (vec (rest more)) acc projs)
+                  [more acc projs]))
+
+              (and (token-ident? (first ts)) (contains? return-aggs (str/lower-case (first ts)))
                    (= "(" (second ts)))
               (let [[agg _ v close & more] ts]
-                (when-not (ident? v) (fail "aggregate needs a variable" v))
+                (when-not (token-ident? v) (fail "aggregate needs a variable" v))
                 (when-not (= ")" close) (fail "aggregate must close with )" close))
                 (let [[alias more] (if (kw? (first more) "AS")
-                                     (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                                     (do (when-not (token-ident? (second more)) (fail "AS needs an alias name" (second more)))
                                          [(symbol (str "?" (second more))) (drop 2 more)])
                                      [(symbol (str "?" (str/lower-case agg) "_" v)) more])
                       acc (conj acc {:agg (keyword (str/lower-case agg)) :var (symbol (str "?" v)) :as alias})]
@@ -390,7 +511,7 @@
                     (recur (vec (rest more)) acc projs)
                     [(vec more) acc projs])))
               ;; fn(arg, ...) [AS alias] -- coalesce / toInteger
-              (and (ident? (first ts)) (contains? return-fns (str/lower-case (first ts)))
+              (and (token-ident? (first ts)) (contains? return-fns (str/lower-case (first ts)))
                    (= "(" (second ts)))
               (let [[more item projs] (parse-fn-call ts projs (count acc))
                     acc (conj acc item)]
@@ -398,12 +519,12 @@
                   (recur (vec (rest more)) acc projs)
                   [more acc projs]))
               ;; v.attr [AS alias]
-              (and (ident? (first ts)) (= "." (second ts)) (ident? (nth ts 2 nil)))
+              (and (token-ident? (first ts)) (= "." (second ts)) (token-ident? (nth ts 2 nil)))
               (let [v (first ts) k (nth ts 2)
                     pv (projection-var v k)
                     more (vec (drop 3 ts))
                     [alias more] (if (kw? (first more) "AS")
-                                   (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                                   (do (when-not (token-ident? (second more)) (fail "AS needs an alias name" (second more)))
                                        [(symbol (str "?" (second more))) (vec (drop 2 more))])
                                    [pv more])
                     ;; The OPTIONAL block binds `pv`; the row must appear under
@@ -417,11 +538,11 @@
                 (if (= "," (first more))
                   (recur (vec (rest more)) acc projs)
                   [more acc projs]))
-              (ident? (first ts))
+              (token-ident? (first ts))
               (let [v (symbol (str "?" (first ts)))
                     more (vec (rest ts))
                     [alias more] (if (kw? (first more) "AS")
-                                   (do (when-not (ident? (second more)) (fail "AS needs an alias name" (second more)))
+                                   (do (when-not (token-ident? (second more)) (fail "AS needs an alias name" (second more)))
                                        [(symbol (str "?" (second more))) (vec (drop 2 more))])
                                    [v more])
                     acc (conj acc alias)
@@ -434,7 +555,9 @@
           (if (and (seq ts) (kw? (first ts) "ORDER"))
             (do (when-not (kw? (second ts) "BY") (fail "ORDER must be followed by BY" (second ts)))
                 (loop [ts (vec (drop 2 ts)) acc []]
-                  (if (and (seq ts) (ident? (first ts)) (not (kw? (first ts) "LIMIT")))
+                  (if (and (seq ts) (token-ident? (first ts))
+                           (not (kw? (first ts) "SKIP"))
+                           (not (kw? (first ts) "LIMIT")))
                     (let [;; ORDER BY v.attr, ORDER BY alias, or ORDER BY fn(alias).
                           ;; A cast is recorded rather than dropped: ordering
                           ;; "10" before "9" is a different answer from ordering
@@ -444,7 +567,7 @@
                           [cast ts] (if fn-cast?
                                       [(keyword (str/lower-case (first ts))) (vec (drop 2 ts))]
                                       [nil ts])
-                          [v ts] (if (and (= "." (second ts)) (ident? (nth ts 2 nil)))
+                          [v ts] (if (and (= "." (second ts)) (token-ident? (nth ts 2 nil)))
                                    [(projection-var (first ts) (nth ts 2)) (vec (drop 3 ts))]
                                    [(symbol (str "?" (first ts))) (vec (rest ts))])
                           ts (if fn-cast?
@@ -462,13 +585,19 @@
                         [ts acc]))
                     (if (empty? acc) (fail "ORDER BY needs variable names" (first ts)) [ts acc]))))
             [ts []])
-          limit
-          (cond
-            (empty? ts) nil
-            (and (kw? (first ts) "LIMIT") (= 2 (count ts)) (re-matches #"[0-9]+" (second ts)))
-            (parse-int (second ts))
-            :else (fail "only ORDER BY / LIMIT allowed after RETURN" (first ts)))
-          bound (-> (set (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
+          [skip ts] (if (kw? (first ts) "SKIP")
+                      (do (when-not (re-matches #"[0-9]+" (str (second ts)))
+                            (fail "SKIP needs a non-negative integer" (second ts)))
+                          [(parse-int (second ts)) (vec (drop 2 ts))])
+                      [nil ts])
+          [limit ts] (if (kw? (first ts) "LIMIT")
+                       (do (when-not (re-matches #"[0-9]+" (str (second ts)))
+                             (fail "LIMIT needs a non-negative integer" (second ts)))
+                           [(parse-int (second ts)) (vec (drop 2 ts))])
+                       [nil ts])
+          _ (when (seq ts) (fail "only ORDER BY / SKIP / LIMIT allowed after RETURN" (first ts)))
+          bound (-> (set initial-bound)
+                    (into (mapcat (fn [[s _ o]] (filter symbol? [s o])) clauses))
                     (into (mapcat (fn [{:keys [from to rel-var]}] (filter symbol? [from to rel-var])) paths))
                     ;; OPTIONAL MATCH binds too -- nullably, but bound.
                     (into (mapcat (fn [blk] (mapcat (fn [[s _ o]] (filter symbol? [s o])) blk))
@@ -480,12 +609,14 @@
                                   match-optional-paths)))
           renames (filterv :rename projections)
           projection-optionals (mapv :block (filterv :block projections))
-          optionals (into (vec match-optionals) projection-optionals)
+          optionals (into (into (vec match-optionals) predicate-optionals) projection-optionals)
           optional-paths (into (vec match-optional-paths)
-                               (repeat (count projection-optionals) []))
+                               (repeat (+ (count predicate-optionals)
+                                          (count projection-optionals)) []))
           projected (set (filter symbol? find-vars))
           agg-items (filterv :agg find-vars)
           fn-items (filterv :fn find-vars)
+          case-items (filterv :case find-vars)
           bare-vars (filterv symbol? find-vars)
           group-by' (when (seq agg-items)
                       (vec (remove (set (map :as (filterv :block projections))) bare-vars)))]
@@ -512,10 +643,15 @@
           (doseq [a args]
             (when (and (symbol? a) (not (bound a)) (not (projection-binds a)))
               (fail (str (name fn) " argument not bound in MATCH/WHERE") (str a))))))
+      (doseq [{:keys [case]} case-items]
+        (let [subject (or (:subject case) (:is-null case))]
+          (when-not (bound subject)
+            (fail "CASE subject not bound in MATCH/WHERE" (str subject)))))
       (doseq [{:keys [var]} order-by']
         (when-not (or (projected var)
                       (some (fn [it] (= var (:as it))) agg-items)
-                      (some (fn [it] (= var (:as it))) fn-items))
+                      (some (fn [it] (= var (:as it))) fn-items)
+                      (some (fn [it] (= var (:as it))) case-items))
           (fail "ORDER BY var must be in RETURN" (str var))))
       (cond-> {:find (vec find-vars) :where (mapv vec clauses)}
         (seq optionals) (assoc :optionals optionals)
@@ -524,6 +660,35 @@
         (seq paths) (assoc :paths paths)
         (seq order-by') (assoc :order-by order-by')
         (seq filters) (assoc :filters filters)
+        predicate (assoc :predicate predicate)
         (seq group-by') (assoc :group-by group-by')
         distinct? (assoc :distinct true)
+        skip (assoc :skip skip)
         limit (assoc :limit limit)))))))
+
+(defn parse
+  "Parse one read query or one bounded two-stage WITH pipeline. WITH materializes
+  its projected rows after ORDER BY/SKIP/LIMIT, then seeds the following MATCH."
+  ([text] (parse text nil))
+  ([text params]
+   (let [ts (tokenize (str text))
+         with-idx (first (keep-indexed #(when (kw? %2 "WITH") %1) ts))]
+     (cond
+       (kw? (first ts) "CREATE") (parse-create text params)
+       (nil? with-idx)
+       (parse-basic text params)
+       :else
+       (let [match-idx (first (keep-indexed
+                               (fn [i t] (when (and (> i with-idx) (kw? t "MATCH")) i)) ts))]
+         (when-not match-idx (fail "WITH must be followed by MATCH" "WITH"))
+         (when (some #(kw? % "WITH") (subvec ts (inc with-idx)))
+           (fail "only one WITH pipeline stage is supported" "WITH"))
+         (let [first-text (str/join " " (concat (subvec ts 0 with-idx)
+                                                  ["RETURN"]
+                                                  (subvec ts (inc with-idx) match-idx)))
+               second-text (str/join " " (subvec ts match-idx))
+               first-stage (parse-basic first-text params)
+               initial-bound (set (map (fn [item] (if (map? item) (:as item) item))
+                                       (:find first-stage)))
+               second-stage (parse-basic second-text params initial-bound)]
+           {:pipeline [first-stage second-stage]}))))))

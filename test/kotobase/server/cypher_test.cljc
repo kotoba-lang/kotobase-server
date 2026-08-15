@@ -89,7 +89,7 @@
     ;; 「受理され、かつ正しく実行される」ことは cypher-ldbc-test が実測する。
     (doseq [q ["MATCH (n) RETURN n"                                    ; 暗黙の全走査はしない
                "OPTIONAL MATCH (a {x: 1}) RETURN a"                    ; MATCH で始まらない
-               "MATCH (a {x: 1})-[:r]->(b) WITH b RETURN b"            ; WITH 未対応
+               "MATCH (a {x: 1})-[:r]->(b) WITH b RETURN b"            ; WITH 後の MATCH が無い
                "MATCH (a {x: 1}) RETURN upper(a.x)"                    ; whitelist 外の関数
                "RETURN 1"]]
       (is (rejected? q) (str "loud reject されるべき: " q))))
