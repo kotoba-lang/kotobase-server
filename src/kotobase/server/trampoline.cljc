@@ -24,6 +24,35 @@
   [cid]
   (ex-info "block-miss" {:block-miss true :cid cid}))
 
+(defn ex-data-chain
+  "`ex-data` of `e` and of every cause beneath it, outermost first.
+
+  Exists because a runtime may WRAP a thrown ex-info rather than rethrow it:
+  nbb/SCI, when the throw crosses an async continuation, produces its own
+  error whose `ex-data` is `{:type :sci/error ...}` and puts the original
+  under `:cause`. Any classifier that reads a marker out of `(ex-data e)`
+  ONCE therefore stops seeing that marker on that runtime -- and, because the
+  marker is what selects the specific outcome, the failure is silent: the
+  request degrades to a generic error, or a retryable miss stops being
+  retried. Read the chain, not the outermost link.
+
+  Bounded (9 links) so a self-referential cause cannot hang a request. On the
+  JVM and under shadow-cljs the chain is one link long, so classifiers keep
+  the behaviour they already had."
+  [e]
+  (->> (iterate ex-cause e) (take-while some?) (take 9) (mapv ex-data)))
+
+(defn miss-data
+  "The trampoline's miss payload (`{:block-miss true :cid ...}`) carried by `e`,
+  or nil if `e` is not a miss.
+
+  Searches the cause chain (see `ex-data-chain`). Every reader of the payload
+  goes through here: `with-blocks` reading `(ex-data e)` inline is what made
+  the trampoline itself blind to the signal, while `block-miss?` -- the
+  documented predicate directly below it -- would have seen it."
+  [e]
+  (first (filter :block-miss (ex-data-chain e))))
+
 (defn block-miss?
   "True if `e` is the trampoline's cache-miss signal. A caller wrapping a
   `with-blocks`-driven computation in its OWN try/catch (e.g. to turn engine
@@ -31,7 +60,7 @@
   instead of swallowing it -- otherwise the trampoline never sees the miss
   and the retry never happens."
   [e]
-  (boolean (:block-miss (ex-data e))))
+  (some? (miss-data e)))
 
 (defn with-blocks
   "Run `(f sync-get)` where `sync-get` reads from an in-memory cache,
@@ -52,15 +81,20 @@
                      (get @cache cid)
                      (throw (missing-block cid))))]
     (letfn [(fetch-and-retry [e]
-              (if (:block-miss (ex-data e))
-                (-> (fetch1 (:cid (ex-data e)))
+              (if-let [d (miss-data e)]
+                (-> (fetch1 (:cid d))
                     (.then (fn [bytes]
-                             (swap! cache assoc (:cid (ex-data e)) bytes)
+                             (swap! cache assoc (:cid d) bytes)
                              (step))))
                 (js/Promise.reject e)))
             (step []
               (try
                 (-> (js/Promise.resolve (f sync-get))
-                    (.catch fetch-and-retry))
+                    ;; The wrapper is load-bearing, not noise: under nbb/SCI a
+                    ;; `letfn` sibling passed BY NAME to a JS callback is never
+                    ;; invoked (`(.catch fetch-and-retry)` silently does
+                    ;; nothing and the miss escapes as a generic failure).
+                    ;; Wrapping in an inline fn is correct on every runtime.
+                    (.catch (fn [e] (fetch-and-retry e))))
                 (catch :default e (fetch-and-retry e))))]
       (step))))

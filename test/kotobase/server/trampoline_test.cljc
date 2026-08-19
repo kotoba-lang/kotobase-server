@@ -75,3 +75,33 @@
                     (is (= boom e) "the original error propagates unchanged")
                     (is (= 0 @fetch-calls) "no retry attempted for a non-miss failure")
                     (done)))))))
+
+(deftest a-wrapped-signal-is-still-a-signal
+  ;; nbb/SCI wraps a throw that crosses an async continuation: the outer error
+  ;; carries `{:type :sci/error ...}` and the original sits under `:cause`.
+  ;; That runtime is the only one that produces the shape, so without this
+  ;; test the shadow-cljs and JVM runs stay green while the unwrapping is
+  ;; removed -- and the failure it causes is silent (a retryable miss stops
+  ;; being retried, a denial degrades to a generic error). Build the shape by
+  ;; hand so every runtime checks it.
+  (let [inner   (tr/missing-block "cid-x")
+        wrapped (ex-info "block-miss" {:type :sci/error :line 77} inner)]
+    (is (= {:block-miss true :cid "cid-x"} (tr/miss-data inner))
+        "unwrapped: unchanged behaviour")
+    (is (= {:block-miss true :cid "cid-x"} (tr/miss-data wrapped))
+        "wrapped: the payload is one link down, not in the outermost ex-data")
+    (is (tr/block-miss? wrapped))
+    (is (nil? (tr/miss-data (ex-info "unrelated" {:type :sci/error}))))
+    (is (false? (tr/block-miss? (ex-info "unrelated" {}))))))
+
+(deftest the-cause-chain-is-bounded-and-ordered
+  ;; A classifier reads this chain per failed request; an unbounded walk would
+  ;; make a deep (or self-referential) cause a hang rather than an error.
+  (let [deep (reduce (fn [e i] (ex-info (str "w" i) {:depth i} e))
+                     (ex-info "root" {:root true})
+                     (range 40))]
+    (is (= 9 (count (tr/ex-data-chain deep))) "bounded")
+    (is (= 39 (:depth (first (tr/ex-data-chain deep)))) "outermost first")
+    (is (nil? (tr/miss-data deep)) "a root buried past the bound is not found")
+    (is (= [{:root true}] (tr/ex-data-chain (ex-info "root" {:root true})))
+        "one link on the JVM and under shadow-cljs")))

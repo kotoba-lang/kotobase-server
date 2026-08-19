@@ -67,7 +67,12 @@
 
 (deftest parameters-are-values-and-a-missing-one-is-loud
   (is (= #{["Ada"]} (rows-of "MATCH (n:Person {id: $pid}) RETURN n.firstName" {"pid" "1"})))
-  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+  (is (thrown-with-msg? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                         #"parameter has no value"
                         (cypher/parse "MATCH (n {id: $pid}) RETURN n" {}))))
 
@@ -122,11 +127,21 @@
 ;; the executor cannot do must fail rather than be quietly approximated.
 (deftest the-executor-refuses-what-it-cannot-do
   (testing "an unknown compiled key is refused"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+    (is (thrown-with-msg? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                           #"does not implement"
                           (qe/execute engine-query {:find '[?a] :where [] :some-future-thing true} adjacency))))
   (testing "a path query with no adjacency fn is refused, not answered zero-hop"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+    (is (thrown-with-msg? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                           #"no adjacency fn"
                           (qe/execute engine-query
                                       (cypher/parse "MATCH (n:Person {id: \"1\"})-[:knows*0..]->(f) RETURN f.id"))))))
@@ -141,7 +156,12 @@
   ;; 2026-08-13 second pass: coalesce is now implemented, so it moved out of this
   ;; list and into their own execution tests. Unknown functions stay loud.
   (doseq [[label q] [["unknown function" "MATCH (a {id: \"1\"}) RETURN upper(a.x)"]]]
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+    (is (thrown? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                  (cypher/parse q {}))
         (str label " must still be rejected loudly, not approximated"))))
 
@@ -174,7 +194,12 @@
                             "OPTIONAL MATCH (n)-[:knows*1..2]-(f) "
                             "RETURN n.id, f.id"))))))
   (testing "an OPTIONAL path still requires an adjacency implementation"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+    (is (thrown-with-msg? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                           #"no adjacency fn"
                           (qe/execute engine-query
                                       (cypher/parse (str "MATCH (n:Person {id: \"1\"}) "
@@ -203,7 +228,12 @@
     (is (= [[nil]] (:rows (run "MATCH (n:Person {id: \"1\"}) RETURN toInteger(n.firstName) AS i"))))))
 
 (deftest an-unknown-function-is-rejected-at-parse-time
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+  (is (thrown? ;; `cljs.core.ExceptionInfo` resolves under shadow-cljs and not under
+                        ;; nbb/SCI, which is the whole difference between this suite
+                        ;; running on a JVM build and running on node. `:default` keeps
+                        ;; the substantive half of the assertion — the MESSAGE — and
+                        ;; widens the type from ex-info to any throwable.
+                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
                (cypher/parse "MATCH (n:Person {id: \"1\"}) RETURN upper(n.firstName)" {}))))
 
 (deftest boolean-where-expressions-preserve-three-valued-property-lookup

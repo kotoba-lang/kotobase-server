@@ -40,6 +40,7 @@
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [kotobase.server.materialized :as materialized]
+            [kotobase.server.trampoline :as tramp]
             [kotobase.server.sparql-protocol :as spp]
             [kotobase.server.cypher :as cypher]
             [kotobase.server.query-exec :as qx]
@@ -1379,7 +1380,15 @@
   InternalError instead."
   [store method body auth]
   (letfn [(err [e]
-            (let [data (ex-data e)]
+            ;; Classify off the whole cause chain, not just `(ex-data e)`:
+            ;; nbb/SCI wraps a throw that crosses an async continuation, and
+            ;; reading one link deep turned a policy denial into a generic
+            ;; InternalError and made a retryable block-miss unretryable.
+            (let [chain (tramp/ex-data-chain e)
+                  data  (or (first (filter #(or (:block-miss %)
+                                                (= :kotobase.policy/write-denied (:type %)))
+                                           chain))
+                            (first chain))]
               (cond
                 (:block-miss data) (throw e)
                 (= :kotobase.policy/write-denied (:type data))
