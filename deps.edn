@@ -38,9 +38,12 @@
         ;; The delegation wire (root ADR-2608180200). Verification needs only
         ;; the root PUBLIC key, which is what lets it run at an edge; the CACAO
         ;; path beside it is unchanged and still the live one.
+        io.github.kotoba-lang/dev-protobuf
+        {:git/url "https://github.com/kotoba-lang/dev-protobuf.git"
+         :git/sha "3f20b1e1cdbe89750d8afaf24f64777a2f170c3c"}
         io.github.kotoba-lang/org-biscuitsec
         {:git/url "https://github.com/kotoba-lang/org-biscuitsec.git"
-         :git/sha "65656798743cbc7e4fd1333cbbb76dcb62e00ff4"}
+         :git/sha "eb44a2ba966a5a6621d36e7921b99a9fec218769"}
         io.github.kotoba-lang/authority
         {:git/url "https://github.com/kotoba-lang/authority.git"
          :git/sha "232eef9b7969aa5990f9b5e48b1184f078500781"}

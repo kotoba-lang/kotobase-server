@@ -1,6 +1,9 @@
 (ns kotobase.server.security.biscuit-authority-test
   "The biscuit path into the same `:effective-caps` the handler reads."
   (:require [biscuit.token :as bt]
+            [biscuit.wire :as bw]
+            ["node:fs" :as fs]
+            [protobuf.wire :as pb]
             [cljs.test :refer-macros [deftest is testing]]
             [kotobase.server.security.authority :as auth]
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
@@ -77,3 +80,92 @@
         forged (assoc-in t [:biscuit/blocks 0 :block/facts]
                          '[[scope "kotoba://graph/acme"] [scope "kotoba://can/admin"]])]
     (is (nil? (auth/verify-biscuit forged opts)))))
+
+;; ── the wire path: a token another implementation minted ────────────────────
+
+(def ^:private samples-root-key
+  "biscuit-auth/biscuit samples/current/samples.json, `root_public_key`."
+  (mapv #(js/parseInt (subs "1055c750b1a1505937af1537c626ba3263995c33a64758aaafb1275b0312e284" % (+ % 2)) 16)
+        (range 0 64 2)))
+
+(deftest the-wire-entry-point-verifies-a-foreign-token
+  (testing "signature-wise: this is a real biscuit-auth token, and the server
+            path verifies it holding only the root public key"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test001_basic.bc")))]
+      ;; Its resources are `right(...)` facts, not kotoba:// scopes, so it
+      ;; confers nothing here — which is the correct answer, and a different
+      ;; one from "the signature was bad".
+      (is (nil? (auth/verify-biscuit-wire bytes
+                                          {:graph "acme" :tenant-id "t1"
+                                           :root-public-key samples-root-key
+                                           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))
+      (testing "and the signature itself does verify, which is why the nil above
+                is about authority rather than about integrity"
+        (is (:ok? (bw/verify (bw/decode-token bytes)
+                                       samples-root-key
+                                       (fn [pk payload sig]
+                                         (try (.verify ed25519
+                                                       (js/Uint8Array.from (clj->js (vec sig)))
+                                                       (js/Uint8Array.from (clj->js (vec payload)))
+                                                       (js/Uint8Array.from (clj->js (vec pk))))
+                                              (catch :default _ false))))))))))
+
+(deftest the-wire-entry-point-refuses-a-token-signed-by-someone-else
+  (testing "and it must refuse before deciding what the token SAYS — deciding
+            first would mean reading an attacker's facts"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test002_different_root_key.bc")))]
+      (is (nil? (auth/verify-biscuit-wire bytes
+                                          {:graph "acme" :tenant-id "t1"
+                                           :root-public-key samples-root-key
+                                           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))
+      (is (false? (:ok? (bw/verify (bw/decode-token bytes) samples-root-key
+                                   (fn [pk payload sig]
+                                     (try (.verify ed25519
+                                                   (js/Uint8Array.from (clj->js (vec sig)))
+                                                   (js/Uint8Array.from (clj->js (vec payload)))
+                                                   (js/Uint8Array.from (clj->js (vec pk))))
+                                          (catch :default _ false))))))))))
+
+(deftest the-wire-entry-point-refuses-a-token-whose-facts-were-rewritten
+  (testing "the attack the signature check exists for, and the only test here
+            that can tell whether it happens"
+    ;; Both official samples carry `right(...)` facts rather than kotoba://
+    ;; scopes, so they confer nothing HERE whether or not the signature is
+    ;; checked -- which means neither can distinguish a path that verifies
+    ;; from one that does not. This token can: its authority block is rewritten
+    ;; to grant kotoba://graph/acme while keeping the original signature, so a
+    ;; path that skips verification returns that capability and a path that
+    ;; checks returns nil.
+    (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test001_basic.bc")))
+          block-schema {1 {:name :symbols :type :string :repeated true}
+                        4 {:name :facts :type :bytes :repeated true}}
+          term-schema {3 {:name :string :type :uint64}}
+          predicate-schema {1 {:name :name :type :uint64}
+                            2 {:name :terms :type :bytes :repeated true}}
+          fact-schema {1 {:name :predicate :type :bytes}}
+          signed-block-schema {1 {:name :block :type :bytes}
+                               2 {:name :next-key :type :bytes}
+                               3 {:name :signature :type :bytes}}
+          biscuit-schema {2 {:name :authority :type :bytes}
+                          3 {:name :blocks :type :bytes :repeated true}
+                          4 {:name :proof :type :bytes}}
+          ;; symbols 1024 = "scope", 1025 = the resource
+          forged-block (pb/encode block-schema
+                                  {:symbols ["scope" "kotoba://graph/acme"]
+                                   :facts [(pb/encode fact-schema
+                                                      {:predicate (pb/encode predicate-schema
+                                                                             {:name 1024
+                                                                              :terms [(pb/encode term-schema {:string 1025})]})})]})
+          original (pb/decode biscuit-schema bytes)
+          orig-auth (pb/decode signed-block-schema (:authority original))
+          forged (pb/encode biscuit-schema
+                            (assoc original :authority
+                                   (pb/encode signed-block-schema
+                                              (assoc orig-auth :block forged-block))))
+          opts {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+                :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}]
+      (testing "the rewrite really does say what it claims to say"
+        (is (= '[[scope "kotoba://graph/acme"]]
+               (:block/facts (first (:biscuit/blocks (bw/token->model (bw/decode-token forged))))))))
+      (testing "and the server refuses it, because the signature no longer covers it"
+        (is (nil? (auth/verify-biscuit-wire forged opts)))))))
