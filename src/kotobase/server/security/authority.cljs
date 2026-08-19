@@ -13,6 +13,7 @@
             [authority.scope :as scope]
             [biscuit.authority :as ba]
             [biscuit.token :as bt]
+            [biscuit.wire :as bw]
             ["@ipld/dag-cbor" :as dag-cbor]
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
 
@@ -100,40 +101,78 @@
              (js/Uint8Array.from (clj->js (vec public-key))))
     (catch :default _ false)))
 
+(defn- caps-from-model
+  "The resource set a verified biscuit confers, or nil.
+
+  The three shape rules are `verify-grant`'s, deliberately: this returns
+  capabilities into the same handler, so a biscuit must not be able to name a
+  resource a CACAO could not."
+  [model {:keys [graph tenant-id require-tenant-binding? now-ms]}]
+  (let [blocks (:biscuit/blocks model)
+        base {:scopes (vec (keep (fn [[p r]] (when (= 'scope p) r))
+                                 (:block/facts (first blocks))))}
+        g (ba/->grant model base)
+        now-iso (.toISOString (js/Date. now-ms))
+        expires (:grant/expires g)
+        resources (set (scope/sorted (:grant/scopes g)))
+        graph-resource (str "kotoba://graph/" graph)
+        tenant-resource (str "kotoba://tenant/" tenant-id)]
+    (when (and (seq resources)
+               (or (nil? expires) (neg? (compare now-iso expires)))
+               (contains? resources graph-resource)
+               (or (not require-tenant-binding?) (contains? resources tenant-resource))
+               (every? #(or (= graph-resource %)
+                            (= tenant-resource %)
+                            (str/starts-with? % "kotoba://can/")) resources))
+      resources)))
+
 (defn verify-biscuit
-  "Effective capabilities from a biscuit, or nil.
+  "Effective capabilities from an already-decoded biscuit, or nil.
 
   `opts` is `{:graph :tenant-id :require-tenant-binding? :root-public-key
   :now-ms}`. `:root-public-key` is a raw 32-byte Ed25519 public key — the
-  only key material this needs, and it is public.
-
-  The resource-shape rules are the same three `verify-grant` enforces, and
-  deliberately so: this returns capabilities into the same handler, so a
-  biscuit must not be able to name a resource a CACAO could not."
-  [token {:keys [graph tenant-id require-tenant-binding? root-public-key now-ms]
-          :or {now-ms (.now js/Date)}}]
+  only key material this needs, and it is public."
+  [token {:keys [root-public-key now-ms] :as opts}]
   (try
-    (let [v (bt/verify token root-public-key biscuit-verify-fn)]
+    (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
+          v (bt/verify token root-public-key biscuit-verify-fn)]
       (when (:ok? v)
-        (let [blocks (:biscuit/blocks token)
-              base {:scopes (vec (keep (fn [[p r]] (when (= 'scope p) r))
-                                       (:block/facts (first blocks))))}
-              g (ba/->grant token base)
-              now-iso (.toISOString (js/Date. now-ms))
-              expires (:grant/expires g)
-              resources (set (scope/sorted (:grant/scopes g)))
-              graph-resource (str "kotoba://graph/" graph)
-              tenant-resource (str "kotoba://tenant/" tenant-id)]
-          (when (and (seq resources)
-                     (or (nil? expires) (neg? (compare now-iso expires)))
-                     (contains? resources graph-resource)
-                     (or (not require-tenant-binding?) (contains? resources tenant-resource))
-                     (every? #(or (= graph-resource %)
-                                  (= tenant-resource %)
-                                  (str/starts-with? % "kotoba://can/")) resources))
-            {:effective-caps resources
-             :root-public-key (vec root-public-key)
-             :blocks (count blocks)
-             :wire :biscuit
-             :delegated? true}))))
+        (when-let [caps (caps-from-model token opts)]
+          {:effective-caps caps
+           :root-public-key (vec root-public-key)
+           :blocks (count (:biscuit/blocks token))
+           :wire :biscuit
+           :delegated? true})))
+    (catch :default _ nil)))
+
+(defn verify-biscuit-wire
+  "The same, from **biscuit v3 wire bytes** — what another implementation
+  actually sends.
+
+  This is the entry point a route should use. `verify-biscuit` above takes
+  the shape this fleet writes by hand, and wiring a route to that would fix a
+  private format into a live auth path; a token minted by `biscuit-auth`
+  arrives as protobuf and enters here.
+
+  Signature verification happens on the WIRE token, before any fact is
+  converted, because converting first would mean deciding what an
+  unverified token says."
+  [token-bytes {:keys [root-public-key now-ms] :as opts}]
+  (try
+    (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
+          decoded (bw/decode-token (vec token-bytes))
+          v (bw/verify decoded root-public-key
+                       (fn [pk payload sig]
+                         (try (.verify ed25519
+                                       (js/Uint8Array.from (clj->js (vec sig)))
+                                       (js/Uint8Array.from (clj->js (vec payload)))
+                                       (js/Uint8Array.from (clj->js (vec pk))))
+                              (catch :default _ false))))]
+      (when (:ok? v)
+        (when-let [caps (caps-from-model (bw/token->model decoded) opts)]
+          {:effective-caps caps
+           :root-public-key (vec root-public-key)
+           :blocks (:blocks v)
+           :wire :biscuit-v3
+           :delegated? true})))
     (catch :default _ nil)))
