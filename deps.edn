@@ -35,6 +35,15 @@
         io.github.kotoba-lang/org-w3-sparql-protocol
         {:git/url "https://github.com/kotoba-lang/org-w3-sparql-protocol.git"
          :git/sha "49c59208442753458daf1dacbf15e1ba6539507f"}
+        ;; The delegation wire (root ADR-2608180200). Verification needs only
+        ;; the root PUBLIC key, which is what lets it run at an edge; the CACAO
+        ;; path beside it is unchanged and still the live one.
+        io.github.kotoba-lang/org-biscuitsec
+        {:git/url "https://github.com/kotoba-lang/org-biscuitsec.git"
+         :git/sha "65656798743cbc7e4fd1333cbbb76dcb62e00ff4"}
+        io.github.kotoba-lang/authority
+        {:git/url "https://github.com/kotoba-lang/authority.git"
+         :git/sha "232eef9b7969aa5990f9b5e48b1184f078500781"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "4926d13e992c7b9c52a44bb7aae672eb80c6c4af"}
