@@ -216,3 +216,41 @@
    request opts
    {:cacao (fn [req o] (verify-chain (:delegations_b64 req) o))
     :biscuit (fn [req o] (verify-biscuit-wire (:biscuit_b64 req) o))}))
+
+(defn read-auth-for-request
+  "The read-side auth a Worker's XRPC read path wants, from either wire.
+
+  `net-kotobase/engine`'s read path calls `verify-cacao-caps` and gets
+  `{:did :resources}` — the capability resources a viewer holds, so graph
+  policies can open protected rows. This produces the same map from a
+  delegation of either wire, so wiring it into that Worker is glue rather
+  than a second auth model.
+
+  -> `{:did :resources :wire}` on success, `{:refused …}` when a credential
+  was presented and rejected, or **nil** when none was presented.
+
+  Those three are kept apart on purpose. The existing read path collapses
+  refusal into anonymity — `nil = anonymous; reads stay open` — which is a
+  defensible contract for reads and a **lossy** one: a caller whose
+  credential was rejected is served as though they had presented nothing, and
+  never learns which. `->legacy-read-auth` performs that collapse where a
+  caller wants it, so it is a decision at a call site rather than a property
+  of this function."
+  [request opts]
+  (let [d (delegation-for-request request opts)]
+    (cond
+      (:effective-caps d) {:did (:holder d)
+                           :resources (:effective-caps d)
+                           :wire (:wire d)}
+      (:refused d) d
+      :else nil)))
+
+(defn ->legacy-read-auth
+  "Collapse to the `{:did :resources}` shape the read path already uses.
+
+  A refusal becomes `nil`, i.e. anonymous. That is what the CACAO read path
+  does today and changing it is a product decision, not a refactor — so the
+  collapse is here, named, rather than hidden inside
+  `read-auth-for-request`."
+  [r]
+  (when (:resources r) (select-keys r [:did :resources])))
