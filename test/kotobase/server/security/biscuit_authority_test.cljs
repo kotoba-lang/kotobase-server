@@ -299,3 +299,33 @@
             "a rotation overlap must not depend on which key is tried first")))
     (testing "and refused under a set containing neither"
       (is (nil? (auth/verify-biscuit-wire token (assoc opts :root-public-keys [(:public b)])))))))
+
+;; ── the read-side shape a Worker consumes ───────────────────────────────────
+
+(deftest read-auth-produces-the-shape-the-read-path-already-uses
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        token (mint-wire-token (:private a) (:public a) "kotoba://graph/acme")
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [(:public a)]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        r (auth/read-auth-for-request {:biscuit_b64 token} opts)]
+    (is (= #{"kotoba://graph/acme"} (:resources r)))
+    (is (= :biscuit (:wire r)))
+    (testing "and it collapses to exactly {:did :resources}"
+      (is (= #{:did :resources} (set (keys (auth/->legacy-read-auth r))))))))
+
+(deftest read-auth-keeps-refused-and-absent-apart
+  (let [opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [samples-root-key]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        bad (vec (js/Array.from (fs/readFileSync "test/fixtures/test002_different_root_key.bc")))]
+    (testing "nothing presented is nil"
+      (is (nil? (auth/read-auth-for-request {} opts))))
+    (testing "presented and rejected is a refusal, not nil"
+      (let [r (auth/read-auth-for-request {:biscuit_b64 bad} opts)]
+        (is (= :verification-failed (:refused r)))
+        (is (nil? (:resources r)))))
+    (testing "and the collapse to the legacy shape turns BOTH into anonymous —
+              which is why the collapse is a named call and not the default"
+      (is (nil? (auth/->legacy-read-auth (auth/read-auth-for-request {} opts))))
+      (is (nil? (auth/->legacy-read-auth (auth/read-auth-for-request {:biscuit_b64 bad} opts)))))))
