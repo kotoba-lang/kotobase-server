@@ -14,6 +14,7 @@
             [biscuit.authority :as ba]
             [biscuit.token :as bt]
             [biscuit.wire :as bw]
+            [kotobase.server.security.credential :as cred]
             ["@ipld/dag-cbor" :as dag-cbor]
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
 
@@ -176,3 +177,30 @@
            :wire :biscuit-v3
            :delegated? true})))
     (catch :default _ nil)))
+
+;; ── the one call a worker makes ─────────────────────────────────────────────
+
+(defn delegation-for-request
+  "Effective capabilities a request's delegation confers, whichever wire it
+  presented — or a refusal.
+
+  This is the surface a Worker is meant to call. Both wires already exist
+  above and `kotobase.server.security.credential` already decides between
+  them; what was missing was a single place that binds the two together, so
+  that a caller cannot accidentally wire only one of them or, worse, wire
+  both as a fallback chain.
+
+  `request` carries `:delegations_b64` (CACAO) or `:biscuit_b64` (biscuit v3
+  bytes) — **never both**, which `credential/select` refuses rather than
+  resolves. `opts` is the union of what the two verifiers need; the biscuit
+  wire additionally needs `:root-public-key` and `:biscuit-enabled-graphs`.
+
+  Returns `{:effective-caps … :wire :cacao|:biscuit}`, or
+  `{:wire nil :reason :no-delegation-presented}`, or `{:refused …}`. A caller
+  that treats every non-`:effective-caps` answer as *deny* is correct; the
+  distinctions exist for the audit trail, not for control flow."
+  [request opts]
+  (cred/verify-with
+   request opts
+   {:cacao (fn [req o] (verify-chain (:delegations_b64 req) o))
+    :biscuit (fn [req o] (verify-biscuit-wire (:biscuit_b64 req) o))}))

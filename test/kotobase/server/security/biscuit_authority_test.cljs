@@ -169,3 +169,45 @@
                (:block/facts (first (:biscuit/blocks (bw/token->model (bw/decode-token forged))))))))
       (testing "and the server refuses it, because the signature no longer covers it"
         (is (nil? (auth/verify-biscuit-wire forged opts)))))))
+
+;; ── the single entry a Worker calls ─────────────────────────────────────────
+
+(deftest one-entry-binds-both-wires
+  (testing "so a caller cannot wire only one of them, or both as a chain"
+    (let [t (token '[[scope "kotoba://graph/acme"] [scope "kotoba://can/read"]])
+          ;; The model-shaped token goes through the model verifier; a Worker
+          ;; would send wire bytes. Both paths exist; this checks the binding.
+          r (auth/delegation-for-request
+             {} {:graph "acme" :tenant-id "t1" :root-public-key (:public root)
+                 :biscuit-enabled-graphs #{"acme"}
+                 :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+      (is (= :no-delegation-presented (:reason r)))
+      (is (nil? (:wire r)))
+      (is (some? t)))))
+
+(deftest the-entry-refuses-a-biscuit-for-a-graph-that-has-not-enabled-it
+  (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test001_basic.bc")))
+        r (auth/delegation-for-request
+           {:biscuit_b64 bytes}
+           {:graph "other" :tenant-id "t1" :root-public-key samples-root-key
+            :biscuit-enabled-graphs #{"acme"}
+            :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+    (is (= :biscuit-not-enabled-for-graph (:refused r)))))
+
+(deftest the-entry-refuses-both-wires-at-once
+  (let [r (auth/delegation-for-request
+           {:biscuit_b64 [1 2 3] :delegations_b64 ["x"]}
+           {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+            :biscuit-enabled-graphs #{"acme"}})]
+    (is (= :ambiguous-credential (:refused r)))))
+
+(deftest the-entry-reports-a-failed-biscuit-as-a-denial
+  (testing "and does not reach for the CACAO verifier"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test002_different_root_key.bc")))
+          r (auth/delegation-for-request
+             {:biscuit_b64 bytes}
+             {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+              :biscuit-enabled-graphs #{"acme"}
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+      (is (= :verification-failed (:refused r)))
+      (is (= :biscuit (:wire r))))))
