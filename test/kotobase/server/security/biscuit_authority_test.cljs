@@ -211,3 +211,91 @@
               :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
       (is (= :verification-failed (:refused r)))
       (is (= :biscuit (:wire r))))))
+
+;; ── a rotating root key set ─────────────────────────────────────────────────
+
+(deftest a-rotation-overlap-accepts-tokens-under-either-root
+  (testing "a rotation has to overlap: tokens minted under the old key are
+            still live when the new one starts being used"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "test/fixtures/test001_basic.bc")))
+          decoded (bw/decode-token bytes)
+          verify (fn [pk payload sig]
+                   (try (.verify ed25519
+                                 (js/Uint8Array.from (clj->js (vec sig)))
+                                 (js/Uint8Array.from (clj->js (vec payload)))
+                                 (js/Uint8Array.from (clj->js (vec pk))))
+                        (catch :default _ false)))
+          other (:public (keypair (map #(+ 7 %) (range 32))))]
+      (testing "the token verifies under the samples root and not under the other"
+        (is (:ok? (bw/verify decoded samples-root-key verify)))
+        (is (false? (:ok? (bw/verify decoded other verify)))))
+      (testing "and a set containing both accepts it, in either order"
+        (doseq [ks [[other samples-root-key] [samples-root-key other]]]
+          ;; test001 grants right(...) rather than kotoba:// scopes, so the
+          ;; caps answer is nil either way; what this asserts is that the
+          ;; SIGNATURE step accepted it from a set, in either order.
+          (is (:ok? (first (filter :ok? (map #(bw/verify decoded % verify) ks))))
+              "a rotation overlap must not depend on which key is tried first")))
+      (testing "a set containing NEITHER is still refused"
+        (is (nil? (auth/verify-biscuit-wire
+                   bytes {:graph "acme" :tenant-id "t1"
+                          :root-public-keys [other]
+                          :biscuit-enabled-graphs #{"acme"}
+                          :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))))))
+
+(defn- mint-wire-token
+  "A minimal, TEST-ONLY biscuit v3 token carrying one scope fact.
+
+  The library refuses to write tokens on purpose: a writer whose output no
+  external implementation has accepted is not evidence of a format. This is
+  not that claim. It exists because the multi-root path cannot be exercised
+  by the official samples -- they grant `right(...)`, so the capability
+  answer is nil whichever root verified them, and a break that tried only the
+  first root passed the suite. Interop evidence still comes from the samples;
+  this only makes the loop observable."
+  [signer-private signer-public resource]
+  (let [block-schema {1 {:name :symbols :type :string :repeated true}
+                      4 {:name :facts :type :bytes :repeated true}}
+        term-schema {3 {:name :string :type :uint64}}
+        predicate-schema {1 {:name :name :type :uint64}
+                          2 {:name :terms :type :bytes :repeated true}}
+        fact-schema {1 {:name :predicate :type :bytes}}
+        public-key-schema {1 {:name :algorithm :type :uint32}
+                           2 {:name :key :type :bytes}}
+        signed-block-schema {1 {:name :block :type :bytes}
+                             2 {:name :next-key :type :bytes}
+                             3 {:name :signature :type :bytes}}
+        biscuit-schema {2 {:name :authority :type :bytes}
+                        4 {:name :proof :type :bytes}}
+        block (pb/encode block-schema
+                         {:symbols ["scope" resource]
+                          :facts [(pb/encode fact-schema
+                                             {:predicate (pb/encode predicate-schema
+                                                                    {:name 1024
+                                                                     :terms [(pb/encode term-schema {:string 1025})]})})]})
+        next-kp (keypair (map #(+ 33 %) (range 32)))
+        next-key-bytes (pb/encode public-key-schema {:algorithm 0 :key (:public next-kp)})
+        ;; v0 payload, the order test001 proved: data || alg(LE32) || next_key
+        payload (vec (concat block [0 0 0 0] (:public next-kp)))
+        sig (vec (.sign ed25519 (js/Uint8Array.from (clj->js payload)) signer-private))]
+    (pb/encode biscuit-schema
+               {:authority (pb/encode signed-block-schema
+                                      {:block block :next-key next-key-bytes :signature sig})
+                :proof [0]})))
+
+(deftest the-multi-root-loop-tries-every-root
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        b (keypair (map #(+ 55 %) (range 32)))
+        token (mint-wire-token (:private a) (:public a) "kotoba://graph/acme")
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}]
+    (testing "the token is accepted under its own root"
+      (is (= #{"kotoba://graph/acme"}
+             (:effective-caps (auth/verify-biscuit-wire token (assoc opts :root-public-keys [(:public a)]))))))
+    (testing "and under a rotation set containing it, in EITHER order"
+      (doseq [ks [[(:public b) (:public a)] [(:public a) (:public b)]]]
+        (is (= #{"kotoba://graph/acme"}
+               (:effective-caps (auth/verify-biscuit-wire token (assoc opts :root-public-keys ks))))
+            "a rotation overlap must not depend on which key is tried first")))
+    (testing "and refused under a set containing neither"
+      (is (nil? (auth/verify-biscuit-wire token (assoc opts :root-public-keys [(:public b)])))))))
