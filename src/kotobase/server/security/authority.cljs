@@ -155,24 +155,36 @@
   private format into a live auth path; a token minted by `biscuit-auth`
   arrives as protobuf and enters here.
 
+  `:root-public-keys` is a SET, because a rotation has to overlap: tokens
+  minted under the old key are still live when the new one starts being used
+  (`biscuit.rootkey` is where that set comes from, verified). `:root-public-key`
+  remains accepted as the single-key case.
+
+  Trying each root is **not** the fallback pattern `credential/select`
+  refuses. There the candidates were different wires, one of which could be
+  weaker, and a caller chose which to present; here every candidate came from
+  one verified log and is equally authoritative, so there is no weaker one to
+  steer a request toward.
+
   Signature verification happens on the WIRE token, before any fact is
-  converted, because converting first would mean deciding what an
-  unverified token says."
-  [token-bytes {:keys [root-public-key now-ms] :as opts}]
+  converted, because converting first would mean deciding what an unverified
+  token says."
+  [token-bytes {:keys [root-public-key root-public-keys now-ms] :as opts}]
   (try
     (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
           decoded (bw/decode-token (vec token-bytes))
-          v (bw/verify decoded root-public-key
-                       (fn [pk payload sig]
+          roots (vec (or (seq root-public-keys) [root-public-key]))
+          verify-bytes (fn [pk payload sig]
                          (try (.verify ed25519
                                        (js/Uint8Array.from (clj->js (vec sig)))
                                        (js/Uint8Array.from (clj->js (vec payload)))
                                        (js/Uint8Array.from (clj->js (vec pk))))
-                              (catch :default _ false))))]
-      (when (:ok? v)
+                              (catch :default _ false)))
+          v (first (filter :ok? (map #(bw/verify decoded % verify-bytes) roots)))]
+      (when v
         (when-let [caps (caps-from-model (bw/token->model decoded) opts)]
           {:effective-caps caps
-           :root-public-key (vec root-public-key)
+           :root-public-keys (mapv vec roots)
            :blocks (:blocks v)
            :wire :biscuit-v3
            :delegated? true})))
