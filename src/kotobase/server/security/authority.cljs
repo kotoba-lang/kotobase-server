@@ -1,11 +1,18 @@
 (ns kotobase.server.security.authority
-  "Verification of explicit CACAO delegation chains. Grants are ordered from
-  trusted root to leaf and monotonically attenuated."
+  "Delegation, verified. Two wires, one answer.
+
+  CACAO chains (below) are ordered trusted-root to leaf and monotonically
+  attenuated. Biscuits (bottom) are attenuated by their own key chain. Both
+  produce `:effective-caps`, which is the only thing the handler reads, so
+  they are alternatives rather than layers."
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [ipld.core :as ipld]
             [kotobase.cacao :as cacao]
             [kotobase.cid :as cid]
+            [authority.scope :as scope]
+            [biscuit.authority :as ba]
+            [biscuit.token :as bt]
             ["@ipld/dag-cbor" :as dag-cbor]
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
 
@@ -65,3 +72,68 @@
        :credential-cids (mapv :credential-cid grants)
        :root-did (:issuer (first grants))
        :delegated? true})))
+
+;; ── biscuit delegation (root ADR-2608180200) ─────────────────────────────────
+;;
+;; The same answer `verify-chain` gives, from the wire this fleet has chosen as
+;; its delegation centre. Both paths land on `:effective-caps`, which is the
+;; only thing the handler downstream reads, so this is additive: no route
+;; changes and the CACAO path is untouched.
+;;
+;; The difference that matters is above, not here: a CACAO chain is verified
+;; with `ed25519.verify` against issuer DIDs the server must know, while a
+;; biscuit is verified against ONE root public key. Every attenuation after
+;; that root is checked by the token's own key chain, so an edge can decide a
+;; call holding nothing secret — which is why the centre is biscuit and not a
+;; bearer format (root ADR-2608180200, `macaroon`'s README for the contrast).
+
+(defn- biscuit-verify-fn
+  "`@noble/curves` Ed25519, in the shape `biscuit.token/verify` injects.
+
+  Keys and signatures cross as raw byte vectors, and the payload is the
+  canonical string the token signs. Nothing here is biscuit-specific — it is
+  the platform's verifier, handed in."
+  [public-key payload signature]
+  (try
+    (.verify ed25519 (js/Uint8Array.from (clj->js (vec signature)))
+             (cid/text->bytes payload)
+             (js/Uint8Array.from (clj->js (vec public-key))))
+    (catch :default _ false)))
+
+(defn verify-biscuit
+  "Effective capabilities from a biscuit, or nil.
+
+  `opts` is `{:graph :tenant-id :require-tenant-binding? :root-public-key
+  :now-ms}`. `:root-public-key` is a raw 32-byte Ed25519 public key — the
+  only key material this needs, and it is public.
+
+  The resource-shape rules are the same three `verify-grant` enforces, and
+  deliberately so: this returns capabilities into the same handler, so a
+  biscuit must not be able to name a resource a CACAO could not."
+  [token {:keys [graph tenant-id require-tenant-binding? root-public-key now-ms]
+          :or {now-ms (.now js/Date)}}]
+  (try
+    (let [v (bt/verify token root-public-key biscuit-verify-fn)]
+      (when (:ok? v)
+        (let [blocks (:biscuit/blocks token)
+              base {:scopes (vec (keep (fn [[p r]] (when (= 'scope p) r))
+                                       (:block/facts (first blocks))))}
+              g (ba/->grant token base)
+              now-iso (.toISOString (js/Date. now-ms))
+              expires (:grant/expires g)
+              resources (set (scope/sorted (:grant/scopes g)))
+              graph-resource (str "kotoba://graph/" graph)
+              tenant-resource (str "kotoba://tenant/" tenant-id)]
+          (when (and (seq resources)
+                     (or (nil? expires) (neg? (compare now-iso expires)))
+                     (contains? resources graph-resource)
+                     (or (not require-tenant-binding?) (contains? resources tenant-resource))
+                     (every? #(or (= graph-resource %)
+                                  (= tenant-resource %)
+                                  (str/starts-with? % "kotoba://can/")) resources))
+            {:effective-caps resources
+             :root-public-key (vec root-public-key)
+             :blocks (count blocks)
+             :wire :biscuit
+             :delegated? true}))))
+    (catch :default _ nil)))
