@@ -1022,6 +1022,36 @@
                       (done)))
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
+(deftest cypher-reads-query-index-ranges-without-hydrating-the-graph
+  (let [hydrations (atom 0)
+        store (assoc (mem-store)
+                     :db-cache-get (constantly nil)
+                     :db-cache-put! (fn [_ _] (swap! hydrations inc)))
+        tx #(h/handle store "transact"
+                      {:graph "gc-indexed"
+                       :tx_edn "[{:db/id \"p1\" :sp/name \"alice\" :sp/knows \"p2\"} {:db/id \"p2\" :unrelated/value \"large-graph-tail\"}]"}
+                      "did:key:ztest")
+        cy #(h/handle store "cypher"
+                      {:graph "gc-indexed"
+                       :cypher "MATCH (a {sp/name: \"alice\"})-[:sp/knows]->(b) RETURN b"}
+                      nil)]
+    #?(:clj
+       (do
+         (is (:ok (tx)))
+         (is (= [["p2"]] (:rows (cy))))
+         (is (zero? @hydrations)
+             "Cypher must not populate the full-db hydration cache"))
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy)))
+             (.then (fn [r]
+                      (is (= [["p2"]] (:rows r)))
+                      (is (zero? @hydrations)
+                          "Cypher must not populate the full-db hydration cache")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
 (deftest sparql-depth-optional-filter-aggregates
   (let [store (mem-store)
         tx (fn [] (h/handle store "transact"

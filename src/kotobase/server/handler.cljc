@@ -38,7 +38,9 @@
             [clojure.string :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
+            [arrangement.datalog :as datalog]
             [kotobase.server.materialized :as materialized]
+            [kotobase.server.pattern-source :as pattern-source]
             [kotobase.server.sparql-protocol :as spp]
             [kotobase.server.cypher :as cypher]
             [kotobase.server.query-exec :as qx]
@@ -582,19 +584,35 @@
                    rows (materialized/query-db db pat (visible-of store) inputs)]
                {:ok true :graph graph :rows (vec rows)})))))
 
-(defn- run-compiled-graph-query
-  "Shared executor for the SPARQL/Cypher compiled-query shape: base BGP to
-  the engine, then OPTIONAL (left join) / FILTER / aggregation in
-  `kotobase.server.query-exec` -- see its docstring for the correctness/
-  performance trade (post-pass over the base result set, not pushed into
-  the engine executor)."
+(defn- compiled-patterns
+  "Every triple pattern the shared compiled-query executor can ask for.
+  Prefetching their planned index ranges gives OPTIONAL/UNION post-passes the
+  same source as the base BGP without hydrating unrelated predicates.
+
+  The storage planner speaks concrete `[s p o]` patterns with nil wildcards;
+  the compiled query speaks Datalog and represents wildcards as unbound
+  symbols. Convert only at this prefetch boundary -- the executor still gets
+  the original variables so it can join them."
+  [{:keys [where unions optionals]}]
+  (mapv (fn [pattern]
+          (mapv #(if (or (symbol? %) (= '_ %)) nil %) pattern))
+        (into (vec where) cat (concat (or unions []) (or optionals [])))))
+
+(defn- run-indexed-compiled-graph-query
+  "Execute the SPARQL/Cypher compiled shape over query-scoped index reads.
+
+  `pattern-source/source-for` applies the row-shaped visibility predicate
+  while reading snapshot + novelty and returns only the union of index ranges
+  named by the query. The Datalog engine then receives `(constantly true)`:
+  unauthorized rows never became quads, and applying the row predicate again
+  to `{:s :p :o}` would be both redundant and shape-incorrect."
   [store graph parsed]
-  (let [chain ((:head-get store) graph)]
-    (then* (hot-db store chain)
-           (fn [db]
-             (let [{:keys [vars rows]} (qx/execute
-                                        (fn [q] (eng/query db q (visible-of store)))
-                                        parsed)]
+  (let [chain ((:head-get store) graph)
+        patterns (compiled-patterns parsed)]
+    (then* (pattern-source/source-for store chain patterns (visible-of store))
+           (fn [source]
+             (let [{:keys [vars rows]}
+                   (qx/execute (fn [q] (datalog/q source q (constantly true))) parsed)]
                {:ok true :graph graph :vars vars :rows rows})))))
 
 (defn do-sparql
@@ -613,13 +631,14 @@
   (spp/do-sparql store body (visible-of store)))
 
 (defn do-cypher
-  "`graph.query` -- CYPHER BASIC SUBSET over the same hot db `do-q` uses.
+  "`graph.query` -- CYPHER BASIC SUBSET over query-scoped index reads.
   body: {:graph :cypher}. `kotobase.server.cypher/parse` compiles
-  MATCH/WHERE/RETURN basic patterns to the exact map-form Datalog `do-q`
-  executes; anything outside the subset returns {:ok false :error
+  MATCH/WHERE/RETURN basic patterns to map-form Datalog, whose named index
+  ranges are prefetched through `pattern-source`; it never hydrates unrelated
+  graph predicates. Anything outside the subset returns {:ok false :error
   \"UnsupportedCypher\"} with the supported grammar in :message -- the
   same loudly-rejected-approximation doctrine as `do-sparql`, which this
-  mirrors exactly (parse ns differs, executor identical)."
+  mirrors exactly."
   [store {:keys [graph cypher]}]
   (let [parsed (try (cypher/parse cypher)
                     (catch #?(:clj Exception :cljs :default) e
@@ -628,7 +647,7 @@
                         (throw e))))]
     (if-some [msg (::unsupported parsed)]
       {:ok false :error "UnsupportedCypher" :message msg}
-      (run-compiled-graph-query store graph parsed))))
+      (run-indexed-compiled-graph-query store graph parsed))))
 
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
