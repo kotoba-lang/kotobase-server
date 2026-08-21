@@ -3,11 +3,10 @@
   (`kotoba-lang/org-w3-sparql-protocol` + `kotoba-lang/sparql`'s algebra)
   over a `kotobase.server.pattern-source` — index reads, not a hydrate.
 
-  Runs BESIDE `kotobase.server.sparql`, which is unchanged and still what
-  `handler/do-sparql` calls. Nothing is switched here (ADR-2608039970,
-  ADR-2608039975): a swap on a live read path is only safe once the two are
-  shown to answer the same thing, and `test/kotobase/server/
-  sparql_equivalence_test.cljc` is where that is shown.
+  This is the implementation `handler/do-sparql` calls after the snapshot
+  equivalence suite proved the former hydrated subset and this index-backed
+  path agreed across the supported grammar (ADR-2608039970,
+  ADR-2608039975).
 
   ## Why two implementations answer differently unless you are careful
 
