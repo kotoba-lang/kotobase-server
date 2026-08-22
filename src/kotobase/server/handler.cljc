@@ -731,6 +731,7 @@
       (cond
         (= 'not head)     (list 'not (normalize-clause (first more)))
         (= 'or head)      (cons 'or (map normalize-clause more))
+        (= 'and head)     (cons 'and (map normalize-clause more))
         (= 'or-join head) (list* 'or-join (first more) (map normalize-clause (rest more)))
         :else             (cons head (map wire-literal more))))
     :else clause))
@@ -753,6 +754,77 @@
       (:where pat) (update :where #(mapv normalize-clause %))
       (:rules pat) (update :rules #(mapv normalize-rule %)))
     (mapv wire-literal pat)))
+
+(defn- clause-triples
+  "Every `[e a v]` triple pattern reachable from ONE `:where`/rule-body
+  clause: the clause itself, both sides of an `and`, every branch of an
+  `or`/`or-join`, and the pattern a `(not ...)` negates.
+
+  A RULE INVOCATION contributes none of its own -- `(ancestor ?x ?y)` names
+  no attribute. Its body's patterns are what the source is asked for, which
+  is why `datalog-source-patterns` walks `:rules` separately and walks EVERY
+  definition rather than only the ones this `:where` reaches. A rule reached
+  only from inside another rule is still evaluated, and a prefetch that
+  missed it would not error -- `datalog.core` would scan a source that does
+  not hold those quads and report FEWER rows, which reads exactly like a
+  query that matched nothing.
+
+  Predicate/function clauses (`[(> ?n 18)]`) are skipped: they evaluate over
+  already-bound values and are never matched against stored datoms. They are
+  told apart from triples the same way `normalize-clause` and
+  `datalog.core/predicate-clause?` do it -- a vector whose first element is
+  a seq."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) []
+    (vector? clause) [clause]
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head)     (mapcat clause-triples more)
+        (= 'or head)      (mapcat clause-triples more)
+        (= 'and head)     (mapcat clause-triples more)
+        (= 'or-join head) (mapcat clause-triples (rest more))
+        :else             []))
+    :else []))
+
+(defn datalog-source-patterns
+  "The `[s p o]` patterns a Datalog map query needs prefetched, WIDENED to
+  what the source must hold rather than narrowed to what any one clause
+  spells.
+
+  Every logic variable becomes `nil`, so a clause is asked for at its widest
+  binding. That is the direction safety runs in: the join and the fixpoint
+  probe with variables SUBSTITUTED, i.e. with patterns narrower than these,
+  and `source-for` hands back a source over the union, which answers a
+  narrower pattern by filtering. Prefetching `[\"Cat\" attr nil]` because the
+  clause happened to name `\"Cat\"` in an argument position would make the
+  answer depend on which bindings existed at plan time -- the same reason
+  `compiled-patterns` prefetches a whole `[nil attr nil]` range for a
+  variable-length path.
+
+  Positions are read by destructuring, exactly as `datalog.query/query`
+  reads them, so a clause with the wrong arity is prefetched the way the
+  engine will actually scan it rather than being silently dropped.
+
+  A clause with a VARIABLE attribute widens to `[nil nil nil]`, one full
+  scan. That is honest and it is not a win over hydrating -- it is the same
+  work -- but it is the same answer, and the plan table in
+  `kotobase.server.datom-plan` already says so in the same words."
+  [{:keys [where rules]}]
+  (->> (concat (mapcat clause-triples where)
+               (mapcat (fn [rule] (mapcat clause-triples (rest rule))) rules))
+       (map (fn [clause]
+              (let [[s p o] clause]
+                (mapv #(when-not (symbol? %) %) [s p o]))))
+       distinct
+       vec))
+
+(defn- datalog-map-query?
+  "A `query_edn` that `arrangement.datalog` understands, as opposed to the
+  plain `[s p o]` triple-pattern vector `arrangement.query` takes."
+  [pat]
+  (and (map? pat) (or (contains? pat :find) (contains? pat :where))))
 
 (defn do-q
   "`datomic.q` -- routes to ONE of two engines depending on `query_edn`'s
@@ -777,16 +849,50 @@
   `normalize-query-literals` first, so a query written the natural
   Datomic way (keyword attributes, keyword/number value literals) matches
   the stringified representation the write path actually stored -- see
-  the normalization section comment above for the live bug this fixes."
-  [store {:keys [graph query_edn inputs_edn] :as body}]
+  the normalization section comment above for the live bug this fixes.
+
+  ## The Datalog form reads INDEXES, not a hydrated database
+
+  A map query runs over `pattern-source/source-for`, the same seam
+  `graph.sparql` and `graph.query` use: the patterns the query names are
+  read as index ranges and nothing else is. It used to hydrate the whole
+  chain into a db value first, which is O(database) per query however few
+  rows come back -- and this is the one method where that cost is not
+  merely a latency question, because RECURSIVE RULES run a fixpoint over
+  it. Reasoning (`subClassOf` closure, type propagation, any transitive
+  property) is what `:rules` is for, and it was the slowest thing here.
+
+  `with_edn` keeps the hydrate path: a speculative db-after is a db VALUE
+  produced by `eng/with`, and there is no index to read it out of. So is
+  the `[s p o]` vector form, which `arrangement.query` answers off a db.
+
+  **`visible?` moves with it, and that is a fix, not a side effect.** The
+  hydrate path handed the per-request ROW predicate (`{:e :a :v_edn}`,
+  `visible-of`'s own contract) to the engine, which applies its `visible?`
+  to `{:s :p :o}` QUADS -- so the predicate read `:a` off a map that has
+  no `:a` and decided every row on `nil`. Depending on which way a policy
+  is written that hid everything or hid nothing; `pattern_source`'s
+  docstring warns about this exact confusion in the other direction. Now
+  the row predicate is applied where rows exist -- inside `hot-datoms`,
+  before a quad is built -- and the engine is handed `(constantly true)`,
+  which is what `run-indexed-compiled-graph-query` already does and for
+  the same reason. `handler-test` pins both halves."
+  [store {:keys [graph query_edn inputs_edn with_edn] :as body}]
   (let [chain ((:head-get store) graph)
-        pat (normalize-query-literals (edn/read-string query_edn))]
-    (then* (db-for-body store chain body)
-           (fn [db]
-             (let [inputs (when inputs_edn
-                            (mapv wire-literal (edn/read-string inputs_edn)))
-                   rows (materialized/query-db db pat (visible-of store) inputs)]
-               {:ok true :graph graph :rows (vec rows)})))))
+        pat (normalize-query-literals (edn/read-string query_edn))
+        inputs (when inputs_edn (mapv wire-literal (edn/read-string inputs_edn)))]
+    (if (and (datalog-map-query? pat) (nil? with_edn))
+      (then* (pattern-source/source-for store chain (datalog-source-patterns pat)
+                                        (visible-of store))
+             (fn [source]
+               (let [rows (if inputs
+                            (datalog/q source pat (constantly true) inputs)
+                            (datalog/q source pat (constantly true)))]
+                 {:ok true :graph graph :rows (vec rows)})))
+      (then* (db-for-body store chain body)
+             (fn [db]
+               (let [rows (materialized/query-db db pat (visible-of store) inputs)]
+                 {:ok true :graph graph :rows (vec rows)}))))))
 
 (defn- compiled-patterns
   "Every triple pattern the shared compiled-query executor can ask for,

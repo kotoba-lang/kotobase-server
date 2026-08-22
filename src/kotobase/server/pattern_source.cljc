@@ -117,10 +117,20 @@
   and issuing it twice is two reads for one answer.
 
   A nil `chain` (a graph with nothing written yet) is an empty source, not an
-  error — the same posture `do-datoms` takes."
+  error — the same posture `do-datoms` takes.
+
+  The result is `src/cached`, which is sound here for the reason that
+  namespace states and not by luck: the source is an immutable snapshot of
+  one chain CID, built once and discarded with the request, so a pattern
+  cannot answer differently on a second ask. What it buys is the fixpoint --
+  `datom.source`'s own measurement is a recursive rule issuing 22 scans that
+  were all the SAME pattern, because semi-naive evaluation shrinks the
+  binding frontier without specializing the clause. Without this, every one
+  of those re-filtered the whole prefetched union."
   ([store chain patterns] (source-for store chain patterns (constantly true)))
   ([store chain patterns visible?]
    (if (nil? chain)
      (then* nil (fn [_] (src/of-quads [])))
      (then* (all* (map #(read-quads store chain % visible?) (plan/reads patterns)))
-            (fn [quad-sets] (src/of-quads (plan/union-quads quad-sets)))))))
+            (fn [quad-sets]
+              (src/cached (src/of-quads (plan/union-quads quad-sets))))))))
