@@ -39,7 +39,9 @@
             [clojure.set :as set]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
+            [arrangement.datalog :as datalog]
             [kotobase.server.materialized :as materialized]
+            [kotobase.server.pattern-source :as pattern-source]
             [kotobase.server.trampoline :as tramp]
             [kotobase.server.sparql-protocol :as spp]
             [kotobase.server.cypher :as cypher]
@@ -786,18 +788,50 @@
                    rows (materialized/query-db db pat (visible-of store) inputs)]
                {:ok true :graph graph :rows (vec rows)})))))
 
-(defn- run-compiled-graph-query
-  "Shared executor for the SPARQL/Cypher compiled-query shape: base BGP to
-  the engine, then OPTIONAL (left join) / FILTER / aggregation in
-  `kotobase.server.query-exec` -- see its docstring for the correctness/
-  performance trade (post-pass over the base result set, not pushed into
-  the engine executor)."
+(defn- compiled-patterns
+  "Every triple pattern the shared compiled-query executor can ask for,
+  including the edge attributes of variable-length paths and both stages of
+  a WITH pipeline. Prefetching their planned index ranges gives OPTIONAL/
+  UNION/path post-passes the same source as the base BGP without hydrating
+  unrelated predicates.
+
+  The storage planner speaks concrete `[s p o]` patterns with nil wildcards;
+  the compiled query speaks Datalog and represents wildcards as unbound
+  symbols. Convert only at this prefetch boundary -- the executor still gets
+  the original variables so it can join them.
+
+  A `:paths` / `:optional-paths` entry BFS-walks `attr` from nodes that are
+  not known until execution, so its prefetch is the whole `[nil attr nil]`
+  range: anything narrower would make reachability depend on what happened
+  to be prefetched."
+  [{:keys [where unions optionals paths optional-paths pipeline]}]
+  (if pipeline
+    (into (compiled-patterns (first pipeline))
+          (compiled-patterns (second pipeline)))
+    (-> (mapv (fn [pattern]
+                (mapv #(if (or (symbol? %) (= '_ %)) nil %) pattern))
+              (into (vec where) cat (concat (or unions []) (or optionals []))))
+        (into (map (fn [{:keys [attr]}] [nil attr nil]))
+              (concat paths (apply concat optional-paths))))))
+
+(defn- run-indexed-compiled-graph-query
+  "Execute the SPARQL/Cypher compiled shape over query-scoped index reads.
+
+  `pattern-source/source-for` applies the row-shaped visibility predicate
+  while reading snapshot + novelty and returns only the union of index ranges
+  named by the query. The Datalog engine then receives `(constantly true)`:
+  unauthorized rows never became quads, and applying the row predicate again
+  to `{:s :p :o}` would be both redundant and shape-incorrect.
+
+  `adjacency` (variable-length / undirected paths) runs over the same source:
+  `compiled-patterns` prefetched the whole `[nil attr nil]` range for every
+  path attribute, so the BFS sees every edge the hydrated executor saw."
   [store graph parsed]
-  (let [chain ((:head-get store) graph)]
-    (then* (hot-db store chain)
-           (fn [db]
-             (let [visible? (visible-of store)
-                   engine-query (fn [q] (eng/query db q visible?))
+  (let [chain ((:head-get store) graph)
+        patterns (compiled-patterns parsed)]
+    (then* (pattern-source/source-for store chain patterns (visible-of store))
+           (fn [source]
+             (let [engine-query (fn [q] (datalog/q source q (constantly true)))
                    adjacency (fn [attr node both?]
                                (concat
                                 (map first
@@ -833,13 +867,15 @@
              {:db/id id} properties))
 
 (defn do-cypher
-  "`graph.query` -- bounded Cypher subset over the same persisted graph used
-  by `do-q`. body: {:graph :cypher}. Reads compile MATCH/WHERE/WITH/RETURN to
-  the shared graph executor. Authenticated standalone-node CREATE reuses
-  `do-transact`, including graph policy checks and conditional head CAS.
-  Anything outside the subset returns {:ok false :error
-  \"UnsupportedCypher\"} with the supported grammar in :message -- the
-  same loudly-rejected-approximation doctrine as `do-sparql`."
+  "`graph.query` -- bounded Cypher subset over query-scoped index reads.
+  body: {:graph :cypher}. Reads compile MATCH/WHERE/WITH/RETURN to the shared
+  graph executor, whose named index ranges are prefetched through
+  `pattern-source`; it never hydrates unrelated graph predicates.
+  Authenticated standalone-node CREATE reuses `do-transact`, including graph
+  policy checks and conditional head CAS. Anything outside the subset returns
+  {:ok false :error \"UnsupportedCypher\"} with the supported grammar in
+  :message -- the same loudly-rejected-approximation doctrine as
+  `do-sparql`."
   [store {:keys [graph cypher]} auth]
   (let [parsed (try (cypher/parse cypher)
                     (catch #?(:clj Exception :cljs :default) e
@@ -864,7 +900,7 @@
                              (seq return-vars)
                              (assoc :vars (mapv str return-vars)
                                     :rows [(mapv by-var return-vars)])))))))))
-        (run-compiled-graph-query store graph parsed)))))
+        (run-indexed-compiled-graph-query store graph parsed)))))
 
 (defn do-pull
   "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
