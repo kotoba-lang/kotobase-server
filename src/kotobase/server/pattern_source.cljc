@@ -4,12 +4,10 @@
 
   ## What it replaces, and why that matters
 
-  Compiled-query reads historically went through `hot-db`: hydrate the whole
+  Every compiled-query read here goes through `hot-db`: hydrate the whole
   chain into a db value, then run an algebra over it. That is O(database) per
   query regardless of how few rows come back — `datom.source`'s own docstring
-  names this as the reason it exists. SPARQL and Cypher now consume this
-  source; Datomic-shaped `do-q` remains on `hot-db` until its broader grammar
-  has an equivalent source-backed plan.
+  names this as the reason it exists.
 
   `hot-datoms` is already the shape that avoids it: a filtered index read
   (`:index` + prefix `:components`, snapshot + novelty merge, range-pruned on
