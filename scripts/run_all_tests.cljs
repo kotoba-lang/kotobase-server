@@ -3,6 +3,7 @@
 ;; needs no compile step, so it runs when a build slot is not available, and
 ;; it exercises the same runtime a Worker does.
 (require '[cljs.test :as t]
+         '[kotobase.server.admission-test]
          '[kotobase.server.cypher-ldbc-test]
          '[kotobase.server.cypher-test]
          '[kotobase.server.handler-test]
@@ -29,6 +30,7 @@
   (when (pos? (+ (:fail m) (:error m))) (js/process.exit 1)))
 
 (t/run-tests
+  'kotobase.server.admission-test
   'kotobase.server.cypher-ldbc-test
   'kotobase.server.cypher-test
   'kotobase.server.handler-test

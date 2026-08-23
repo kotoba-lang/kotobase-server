@@ -133,4 +133,18 @@
      (then* nil (fn [_] (src/of-quads [])))
      (then* (all* (map #(read-quads store chain % visible?) (plan/reads patterns)))
             (fn [quad-sets]
-              (src/cached (src/of-quads (plan/union-quads quad-sets))))))))
+              (let [quads (plan/union-quads quad-sets)]
+                (with-meta (src/cached (src/of-quads quads))
+                  {::datom-count (count quads)})))))))
+
+(defn datom-count
+  "How many datoms a `source-for` source holds, or nil for a source built
+  somewhere else.
+
+  Carried as metadata rather than returned in a pair because every existing
+  caller takes the source itself, and a caller that does not ask this is a
+  caller that does not bound itself -- which is a thing an admission gate
+  should be able to SEE, by getting nil, rather than a thing hidden behind a
+  changed arity that everyone updates mechanically."
+  [source]
+  (::datom-count (meta source)))
