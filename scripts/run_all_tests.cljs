@@ -4,6 +4,7 @@
 ;; it exercises the same runtime a Worker does.
 (require '[cljs.test :as t]
          '[kotobase.server.admission-test]
+         '[kotobase.server.clause-cardinality-test]
          '[kotobase.server.cypher-ldbc-test]
          '[kotobase.server.cypher-test]
          '[kotobase.server.handler-test]
@@ -31,6 +32,7 @@
 
 (t/run-tests
   'kotobase.server.admission-test
+  'kotobase.server.clause-cardinality-test
   'kotobase.server.cypher-ldbc-test
   'kotobase.server.cypher-test
   'kotobase.server.handler-test

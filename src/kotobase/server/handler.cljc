@@ -891,9 +891,16 @@
                  (fn [source]
                    (if-let [over (admission/over-budget (or (pattern-source/datom-count source) 0))]
                      (admission/refusal-response [over])
-                     (let [rows (if inputs
-                                  (datalog/q source pat (constantly true) inputs)
-                                  (datalog/q source pat (constantly true)))]
+                     ;; The hint that lets the engine hash-join instead of
+                     ;; issuing one keyed scan per binding. See
+                     ;; `pattern-source/clause-cardinality` for why counting is
+                     ;; free on this side of the seam and would not be on the
+                     ;; other.
+                     (let [planned (assoc pat :clause-cardinality
+                                          (pattern-source/clause-cardinality source pat))
+                           rows (if inputs
+                                  (datalog/q source planned (constantly true) inputs)
+                                  (datalog/q source planned (constantly true)))]
                        {:ok true :graph graph :rows (vec rows)}))))))
       ;; The hydrate path is gated too, and it has to be: a caller that could
       ;; reach a whole-graph read by switching to the `[s p o]` vector form
@@ -956,7 +963,11 @@
       (admission/refusal-response refusals)
       (then* (pattern-source/source-for store chain patterns (visible-of store))
            (fn [source]
-             (let [engine-query (fn [q] (datalog/q source q (constantly true)))
+             (let [engine-query (fn [q]
+                                  (datalog/q source
+                                             (assoc q :clause-cardinality
+                                                    (pattern-source/clause-cardinality source q))
+                                             (constantly true)))
                    adjacency (fn [attr node both?]
                                (concat
                                 (map first

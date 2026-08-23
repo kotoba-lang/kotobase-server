@@ -209,6 +209,13 @@
                  ;; nothing while looking like it did.
                  (if-let [over (admission/over-budget (or (ps/datom-count source) 0))]
                    (admission/refusal-response [over])
+                   ;; No `:clause-cardinality` here, deliberately: this surface
+                   ;; does not hand the algebra to `datalog.core` at all. It
+                   ;; materialises the named ranges into a quad seq and runs
+                   ;; `sparql.core`'s own BGP, which joins in memory already --
+                   ;; there is no keyed-scan-per-binding path to replace. The
+                   ;; hint belongs where the Datalog executor is, which is
+                   ;; `handler`'s two doors.
                    (let [quad-seq (quads/source->quads source patterns (constantly true))]
                      (select-response graph (:output-vars parsed)
                                       (sparql/select algebra quad-seq)))))))))))

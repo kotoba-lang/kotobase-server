@@ -148,3 +148,59 @@
   changed arity that everyone updates mechanically."
   [source]
   (::datom-count (meta source)))
+
+(defn- broad-pattern
+  "The clause with every variable and wildcard nil -- exactly
+  `datalog.core/broad-pattern`, which is what the hash-join path scans. Kept
+  identical on purpose: a cardinality computed for a different pattern than
+  the one the executor will scan is a hint about a relation that is not the
+  one being joined."
+  [clause]
+  (mapv (fn [t] (if (symbol? t) nil t)) (take 3 (concat clause (repeat nil)))))
+
+(defn- clause-seq
+  "Every triple clause reachable from one `:where`/rule-body element."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) []
+    (vector? clause) [clause]
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head) (mapcat clause-seq more)
+        (= 'or head) (mapcat clause-seq more)
+        (= 'and head) (mapcat clause-seq more)
+        (= 'or-join head) (mapcat clause-seq (rest more))
+        :else []))
+    :else []))
+
+(defn clause-cardinality
+  "`{clause row-count}` for every triple clause of `query`, counted against
+  `source`.
+
+  This is the hint `datalog.core/q` needs to choose ONE broad scan plus an
+  in-memory hash join over N keyed scans. Without it the engine stays on the
+  keyed path, which is the correct default for a caller that did not plan --
+  and this server was that caller, so every join it ran was index-nested-loop.
+  Measured 2026-08-23 on a 963-quad graph: a two-clause join asked the source
+  61 times for a 60-row answer and a three-clause join asked 601 times for 40
+  rows, against a floor of 2 and 3.
+
+  Counting is nearly free HERE and would not be somewhere else, which is the
+  whole reason this belongs on this side of the seam. `source-for` has already
+  fetched every range the query names and wrapped them in a per-request scan
+  cache, so each broad pattern is one cached scan of resident data -- no block
+  read, no round trip. The engine's own budget comment warns that a broad scan
+  of a large relation is the mistake it exists to avoid; over a remote source
+  that is true, and over this one the relation is already in hand.
+
+  Rule bodies are included. The fixpoint re-asks its clauses every round, so
+  it is the place where N keyed scans hurt most -- and the hint only ever
+  ENABLES the hash path when the relation is small relative to the number of
+  scans it replaces, so including a clause can never make it choose worse."
+  [source {:keys [where rules]}]
+  (into {}
+        (map (fn [clause] [clause (count (src/scan-set source (broad-pattern clause)))]))
+        (distinct
+         (concat (mapcat clause-seq where)
+                 (mapcat (fn [rule] (mapcat clause-seq (rest rule))) rules)))))
