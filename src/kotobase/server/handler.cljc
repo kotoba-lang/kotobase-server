@@ -42,6 +42,7 @@
             [arrangement.datalog :as datalog]
             [kotobase.server.materialized :as materialized]
             [kotobase.server.pattern-source :as pattern-source]
+            [kotobase.server.admission :as admission]
             [kotobase.server.trampoline :as tramp]
             [kotobase.server.sparql-protocol :as spp]
             [kotobase.server.cypher :as cypher]
@@ -882,17 +883,32 @@
         pat (normalize-query-literals (edn/read-string query_edn))
         inputs (when inputs_edn (mapv wire-literal (edn/read-string inputs_edn)))]
     (if (and (datalog-map-query? pat) (nil? with_edn))
-      (then* (pattern-source/source-for store chain (datalog-source-patterns pat)
-                                        (visible-of store))
-             (fn [source]
-               (let [rows (if inputs
-                            (datalog/q source pat (constantly true) inputs)
-                            (datalog/q source pat (constantly true)))]
-                 {:ok true :graph graph :rows (vec rows)})))
-      (then* (db-for-body store chain body)
-             (fn [db]
-               (let [rows (materialized/query-db db pat (visible-of store) inputs)]
-                 {:ok true :graph graph :rows (vec rows)}))))))
+      (let [{:keys [admitted? refusals]} (admission/admit pat)]
+        (if-not admitted?
+          (admission/refusal-response refusals)
+          (then* (pattern-source/source-for store chain (datalog-source-patterns pat)
+                                            (visible-of store))
+                 (fn [source]
+                   (if-let [over (admission/over-budget (or (pattern-source/datom-count source) 0))]
+                     (admission/refusal-response [over])
+                     (let [rows (if inputs
+                                  (datalog/q source pat (constantly true) inputs)
+                                  (datalog/q source pat (constantly true)))]
+                       {:ok true :graph graph :rows (vec rows)}))))))
+      ;; The hydrate path is gated too, and it has to be: a caller that could
+      ;; reach a whole-graph read by switching to the `[s p o]` vector form
+      ;; would make the gate above a suggestion. `admit-patterns` sees the same
+      ;; pattern the planner would.
+      (let [{:keys [admitted? refusals]}
+            (if (datalog-map-query? pat)
+              (admission/admit pat)
+              (admission/admit-patterns [(vec (take 3 (concat pat (repeat nil))))]))]
+        (if-not admitted?
+          (admission/refusal-response refusals)
+          (then* (db-for-body store chain body)
+                 (fn [db]
+                   (let [rows (materialized/query-db db pat (visible-of store) inputs)]
+                     {:ok true :graph graph :rows (vec rows)}))))))))
 
 (defn- compiled-patterns
   "Every triple pattern the shared compiled-query executor can ask for,
@@ -934,8 +950,11 @@
   path attribute, so the BFS sees every edge the hydrated executor saw."
   [store graph parsed]
   (let [chain ((:head-get store) graph)
-        patterns (compiled-patterns parsed)]
-    (then* (pattern-source/source-for store chain patterns (visible-of store))
+        patterns (compiled-patterns parsed)
+        {:keys [admitted? refusals]} (admission/admit-patterns patterns)]
+    (if-not admitted?
+      (admission/refusal-response refusals)
+      (then* (pattern-source/source-for store chain patterns (visible-of store))
            (fn [source]
              (let [engine-query (fn [q] (datalog/q source q (constantly true)))
                    adjacency (fn [attr node both?]
@@ -949,8 +968,11 @@
                                        (engine-query
                                         {:find ['?subject]
                                          :where [['?subject attr node]]})))))
-                   {:keys [vars rows]} (qx/execute engine-query parsed adjacency)]
-               {:ok true :graph graph :vars vars :rows rows})))))
+                   over (admission/over-budget (or (pattern-source/datom-count source) 0))]
+               (if over
+                 (admission/refusal-response [over])
+                 (let [{:keys [vars rows]} (qx/execute engine-query parsed adjacency)]
+                   {:ok true :graph graph :vars vars :rows rows}))))))))
 
 (defn do-sparql
   "`graph.sparql` -- the SPARQL 1.1 Protocol implementation
