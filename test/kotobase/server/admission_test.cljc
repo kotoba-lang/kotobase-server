@@ -124,3 +124,39 @@
                  (is (:ok resp))
                  (is (= [["Cat"]] (:rows resp))
                      "and a bounded query still answers, which is the half a gate usually breaks"))))])))
+
+(deftest the-deployed-sparql-surface-refuses-select-star
+  (testing "graph.sparql reaches sparql-protocol/do-sparql, NOT the compiled path"
+    ;; This gap shipped once: `kotobase.server.admission` landed gating
+    ;; `do-q` and `run-indexed-compiled-graph-query`, and the surface that
+    ;; actually answers `graph.sparql` went through neither.
+    ;; `verify-unbounded-query-paths` reported the file for requiring
+    ;; `pattern-source` and never mentioning `admission`, which is how this
+    ;; test came to exist.
+    (let [store (mem-store) reads (::reads store) measured (atom {})]
+      (run
+       [(fn [] (h/handle store "transact" {:graph "g" :tx_edn tx} "did:key:ztest"))
+        (fn []
+          (reset! reads 0)
+          (then* (h/handle store "sparql"
+                           {:graph "g" :sparql "SELECT ?s ?p ?o WHERE { ?s ?p ?o }"} nil)
+                 (fn [resp]
+                   (swap! measured assoc :refused-reads @reads)
+                   (is (false? (:ok resp)))
+                   (is (= "QueryRefused" (:error resp))
+                       (str "SELECT * is the whole-graph read: " (pr-str resp))))))
+        (fn []
+          (reset! reads 0)
+          (then* (h/handle store "sparql"
+                           {:graph "g" :sparql "SELECT ?c WHERE { ?s <:rdf/type> ?c }"} nil)
+                 (fn [resp]
+                   (swap! measured assoc :admitted-reads @reads)
+                   (is (:ok resp)
+                       (str "a bound predicate still answers: " (pr-str resp))))))
+        (fn []
+          (let [{:keys [refused-reads admitted-reads]} @measured]
+            ;; NOT `zero?`: `handle` resolves the request's visibility policy
+            ;; before dispatching, and that read happens either way. What the
+            ;; gate saves is the QUERY's read, which is the difference.
+            (is (< refused-reads admitted-reads)
+                (str "refused=" refused-reads " admitted=" admitted-reads))))]))))
