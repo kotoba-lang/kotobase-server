@@ -34,6 +34,7 @@
   (:require [kotobase.protocols.sparql.parser :as parser]
             [kotobase.protocols.sparql.quads :as quads]
             [kotobase.server.pattern-source :as ps]
+            [kotobase.server.admission :as admission]
             [sparql.core :as sparql]))
 
 (defn- then* [x f]
@@ -188,13 +189,26 @@
       ;; the coercion applied to the algebra alone.
       (let [algebra (coerce-algebra (:algebra parsed))
             patterns (quads/algebra->scan-patterns algebra)
-            chain ((:head-get store) graph)]
-        (then* (ps/source-for store chain patterns (or visible? (constantly true)))
+            chain ((:head-get store) graph)
+            ;; This is the DEPLOYED SPARQL path -- `graph.sparql` reaches
+            ;; here, not `run-indexed-compiled-graph-query` -- so the gate has
+            ;; to be here too. It was not, on the first landing of
+            ;; `kotobase.server.admission`, and nothing said so until
+            ;; `verify-unbounded-query-paths` reported this file for requiring
+            ;; `pattern-source` and never mentioning `admission`. A `SELECT *
+            ;; WHERE { ?s ?p ?o }` is exactly the whole-graph read that gate
+            ;; exists to refuse, and this surface takes it from the network.
+            {:keys [admitted? refusals]} (admission/admit-patterns patterns)]
+        (if-not admitted?
+          (admission/refusal-response refusals)
+          (then* (ps/source-for store chain patterns (or visible? (constantly true)))
                (fn [source]
                  ;; `(constantly true)` deliberately: the viewer filter already
                  ;; ran at the row level inside `hot-datoms`, and applying a
                  ;; ROW-shaped predicate to `{:s :p :o}` quads would filter
                  ;; nothing while looking like it did.
-                 (let [quad-seq (quads/source->quads source patterns (constantly true))]
-                   (select-response graph (:output-vars parsed)
-                                    (sparql/select algebra quad-seq)))))))))
+                 (if-let [over (admission/over-budget (or (ps/datom-count source) 0))]
+                   (admission/refusal-response [over])
+                   (let [quad-seq (quads/source->quads source patterns (constantly true))]
+                     (select-response graph (:output-vars parsed)
+                                      (sparql/select algebra quad-seq)))))))))))
