@@ -43,7 +43,7 @@
          :git/sha "3f20b1e1cdbe89750d8afaf24f64777a2f170c3c"}
         io.github.kotoba-lang/org-biscuitsec
         {:git/url "https://github.com/kotoba-lang/org-biscuitsec.git"
-         :git/sha "eb44a2ba966a5a6621d36e7921b99a9fec218769"}
+         :git/sha "4c05fa54ecb2b502ef64eabeb8070759b6a63541"}
         io.github.kotoba-lang/authority
         {:git/url "https://github.com/kotoba-lang/authority.git"
          :git/sha "232eef9b7969aa5990f9b5e48b1184f078500781"}

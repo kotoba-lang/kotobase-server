@@ -102,8 +102,8 @@
              (js/Uint8Array.from (clj->js (vec public-key))))
     (catch :default _ false)))
 
-(defn- caps-from-model
-  "The resource set a verified biscuit confers, or nil.
+(defn- authority-from-model
+  "The resources and holder a verified biscuit confers, or nil.
 
   The three shape rules are `verify-grant`'s, deliberately: this returns
   capabilities into the same handler, so a biscuit must not be able to name a
@@ -125,7 +125,9 @@
                (every? #(or (= graph-resource %)
                             (= tenant-resource %)
                             (str/starts-with? % "kotoba://can/")) resources))
-      resources)))
+      {:effective-caps resources
+       :holder (:grant/holder g)
+       :expires-at expires})))
 
 (defn verify-biscuit
   "Effective capabilities from an already-decoded biscuit, or nil.
@@ -138,12 +140,12 @@
     (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
           v (bt/verify token root-public-key biscuit-verify-fn)]
       (when (:ok? v)
-        (when-let [caps (caps-from-model token opts)]
-          {:effective-caps caps
-           :root-public-key (vec root-public-key)
-           :blocks (count (:biscuit/blocks token))
-           :wire :biscuit
-           :delegated? true})))
+        (when-let [authority (authority-from-model token opts)]
+          (merge authority
+                 {:root-public-key (vec root-public-key)
+                  :blocks (count (:biscuit/blocks token))
+                  :wire :biscuit
+                  :delegated? true}))))
     (catch :default _ nil)))
 
 (defn verify-biscuit-wire
@@ -169,7 +171,8 @@
   Signature verification happens on the WIRE token, before any fact is
   converted, because converting first would mean deciding what an unverified
   token says."
-  [token-bytes {:keys [root-public-key root-public-keys now-ms] :as opts}]
+  [token-bytes {:keys [root-public-key root-public-keys now-ms
+                       revoked-biscuit-signatures] :as opts}]
   (try
     (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
           decoded (bw/decode-token (vec token-bytes))
@@ -181,13 +184,14 @@
                                        (js/Uint8Array.from (clj->js (vec pk))))
                               (catch :default _ false)))
           v (first (filter :ok? (map #(bw/verify decoded % verify-bytes) roots)))]
-      (when v
-        (when-let [caps (caps-from-model (bw/token->model decoded) opts)]
-          {:effective-caps caps
-           :root-public-keys (mapv vec roots)
-           :blocks (:blocks v)
-           :wire :biscuit-v3
-           :delegated? true})))
+      (when (and v (not (bw/revoked? decoded (set revoked-biscuit-signatures))))
+        (when-let [authority (authority-from-model (bw/token->model decoded) opts)]
+          (merge authority
+                 {:root-public-keys (mapv vec roots)
+                  :blocks (:blocks v)
+                  :revocation-ids (bw/revocation-ids decoded)
+                  :wire :biscuit-v3
+                  :delegated? true}))))
     (catch :default _ nil)))
 
 ;; ── the one call a worker makes ─────────────────────────────────────────────

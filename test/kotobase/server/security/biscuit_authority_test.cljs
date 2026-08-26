@@ -243,45 +243,22 @@
                           :biscuit-enabled-graphs #{"acme"}
                           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))))))
 
-(defn- mint-wire-token
-  "A minimal, TEST-ONLY biscuit v3 token carrying one scope fact.
+(defn- mint-wire-facts [signer-private facts]
+  (let [next-seed (vec (map #(+ 33 %) (range 32)))
+        next-kp (keypair next-seed)]
+    (bw/encode-authority-token
+     {:facts facts
+      :root-private-key signer-private
+      :next-secret next-seed
+      :next-public-key (:public next-kp)
+      :sign-fn (fn [private payload]
+                 (vec (.sign ed25519 (js/Uint8Array.from (clj->js payload)) private)))})))
 
-  The library refuses to write tokens on purpose: a writer whose output no
-  external implementation has accepted is not evidence of a format. This is
-  not that claim. It exists because the multi-root path cannot be exercised
-  by the official samples -- they grant `right(...)`, so the capability
-  answer is nil whichever root verified them, and a break that tried only the
-  first root passed the suite. Interop evidence still comes from the samples;
-  this only makes the loop observable."
-  [signer-private signer-public resource]
-  (let [block-schema {1 {:name :symbols :type :string :repeated true}
-                      4 {:name :facts :type :bytes :repeated true}}
-        term-schema {3 {:name :string :type :uint64}}
-        predicate-schema {1 {:name :name :type :uint64}
-                          2 {:name :terms :type :bytes :repeated true}}
-        fact-schema {1 {:name :predicate :type :bytes}}
-        public-key-schema {1 {:name :algorithm :type :uint32}
-                           2 {:name :key :type :bytes}}
-        signed-block-schema {1 {:name :block :type :bytes}
-                             2 {:name :next-key :type :bytes}
-                             3 {:name :signature :type :bytes}}
-        biscuit-schema {2 {:name :authority :type :bytes}
-                        4 {:name :proof :type :bytes}}
-        block (pb/encode block-schema
-                         {:symbols ["scope" resource]
-                          :facts [(pb/encode fact-schema
-                                             {:predicate (pb/encode predicate-schema
-                                                                    {:name 1024
-                                                                     :terms [(pb/encode term-schema {:string 1025})]})})]})
-        next-kp (keypair (map #(+ 33 %) (range 32)))
-        next-key-bytes (pb/encode public-key-schema {:algorithm 0 :key (:public next-kp)})
-        ;; v0 payload, the order test001 proved: data || alg(LE32) || next_key
-        payload (vec (concat block [0 0 0 0] (:public next-kp)))
-        sig (vec (.sign ed25519 (js/Uint8Array.from (clj->js payload)) signer-private))]
-    (pb/encode biscuit-schema
-               {:authority (pb/encode signed-block-schema
-                                      {:block block :next-key next-key-bytes :signature sig})
-                :proof [0]})))
+(defn- mint-wire-token
+  "A minimal first-party Biscuit v3 token carrying one scope fact. The writer
+  is independently accepted by the official Rust verifier in org-biscuitsec."
+  [signer-private _signer-public resource]
+  (mint-wire-facts signer-private [['scope resource]]))
 
 (deftest the-multi-root-loop-tries-every-root
   (let [a (keypair (map #(+ 11 %) (range 32)))
@@ -313,6 +290,21 @@
     (is (= :biscuit (:wire r)))
     (testing "and it collapses to exactly {:did :resources}"
       (is (= #{:did :resources} (set (keys (auth/->legacy-read-auth r))))))))
+
+(deftest wire-holder-becomes-the-request-principal-and-revocation-denies
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        token (mint-wire-facts (:private a)
+                               '[[scope "kotoba://graph/acme"]
+                                 [holder "did:key:zAlice"]])
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [(:public a)]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        r (auth/read-auth-for-request {:biscuit_b64 token} opts)
+        signature (second (first (bw/revocation-ids (bw/decode-token token))))]
+    (is (= "did:key:zAlice" (:did r)))
+    (is (seq (:revocation-ids (auth/verify-biscuit-wire token opts))))
+    (is (nil? (auth/verify-biscuit-wire
+               token (assoc opts :revoked-biscuit-signatures #{signature}))))))
 
 (deftest read-auth-keeps-refused-and-absent-apart
   (let [opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
