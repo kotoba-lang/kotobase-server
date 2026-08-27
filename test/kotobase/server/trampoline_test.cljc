@@ -105,3 +105,77 @@
     (is (nil? (tr/miss-data deep)) "a root buried past the bound is not found")
     (is (= [{:root true}] (tr/ex-data-chain (ex-info "root" {:root true})))
         "one link on the JVM and under shadow-cljs")))
+
+;; ── seeded cache (3-arity) ───────────────────────────────────────────────────
+;; The observable that matters is HOW MANY TIMES `f` RAN, not whether the answer
+;; is right. `f` is re-run from scratch per miss, so K uncached blocks cost K+1
+;; runs of the whole handler -- that quadratic is the term that put reads at
+;; 20-25 CPU-seconds in production, and a caller-side block cache cannot touch
+;; it because the cache in here is private and starts empty.
+
+(defn- counting-fetch
+  "fetch1 over `bytes-for`, recording every cid it is asked for."
+  [calls bytes-for]
+  (fn [cid] (swap! calls conj cid) (js/Promise.resolve (get bytes-for cid))))
+
+(def ^:private four-blocks {"a" #js [1] "b" #js [2] "c" #js [3] "d" #js [4]})
+
+(defn- read-four [runs]
+  (fn [sync-get]
+    (swap! runs inc)
+    (reduce + (map #(.-length (sync-get %)) ["a" "b" "c" "d"]))))
+
+(deftest unseeded-reruns-f-once-per-miss
+  (testing "the cost being removed, pinned first so the seeded case has
+            something to be measured against"
+    (async done
+      (let [calls (atom []) runs (atom 0)]
+        (-> (tr/with-blocks (counting-fetch calls four-blocks) (read-four runs))
+            (.then (fn [v]
+                     (is (= 4 v))
+                     (is (= ["a" "b" "c" "d"] @calls))
+                     (is (= 5 @runs) "K=4 misses re-run the whole handler K+1 times")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest a-fully-seeded-cache-runs-f-once-and-fetches-nothing
+  (testing "the guarantee: blocks the caller already resolved cost neither a
+            fetch nor a re-run"
+    (async done
+      (let [calls (atom []) runs (atom 0)]
+        (-> (tr/with-blocks (counting-fetch calls four-blocks) (read-four runs) four-blocks)
+            (.then (fn [v]
+                     (is (= 4 v))
+                     (is (= [] @calls) "seeded blocks are never fetched again")
+                     (is (= 1 @runs) "one run, not five -- this is the O(K^2) term going away")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest a-partial-seed-only-pays-for-what-it-is-missing
+  (testing "a stale or incomplete manifest must degrade, never break: the
+            un-seeded blocks trampoline exactly as before"
+    (async done
+      (let [calls (atom []) runs (atom 0)]
+        (-> (tr/with-blocks (counting-fetch calls four-blocks) (read-four runs)
+                            {"a" #js [1] "b" #js [2]})
+            (.then (fn [v]
+                     (is (= 4 v))
+                     (is (= ["c" "d"] @calls) "only the un-seeded cids are fetched")
+                     (is (= 3 @runs) "2 misses -> 3 runs, down from 5")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest nil-and-empty-seeds-behave-exactly-like-the-two-arity
+  (testing "the compatibility claim in the docstring, asserted rather than
+            assumed -- every existing caller passes no seed"
+    (async done
+      (let [c1 (atom []) r1 (atom 0) c2 (atom []) r2 (atom 0)]
+        (-> (js/Promise.all
+             #js [(tr/with-blocks (counting-fetch c1 four-blocks) (read-four r1) nil)
+                  (tr/with-blocks (counting-fetch c2 four-blocks) (read-four r2) {})])
+            (.then (fn [vs]
+                     (is (= [4 4] (vec vs)))
+                     (is (= ["a" "b" "c" "d"] @c1 @c2))
+                     (is (= 5 @r1 @r2) "same K+1 runs the 2-arity produces")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))

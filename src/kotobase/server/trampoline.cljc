@@ -73,28 +73,49 @@
   block-miss can therefore surface either as a SYNC throw from `f` or as a
   REJECTION of `f`'s promise (sync-get called inside a `.then`
   continuation), and both trampoline the same way. Non-miss failures reject
-  through unchanged."
-  [fetch1 f]
-  (let [cache (atom {})
-        sync-get (fn [cid]
-                   (if (contains? @cache cid)
-                     (get @cache cid)
-                     (throw (missing-block cid))))]
-    (letfn [(fetch-and-retry [e]
-              (if-let [d (miss-data e)]
-                (-> (fetch1 (:cid d))
-                    (.then (fn [bytes]
-                             (swap! cache assoc (:cid d) bytes)
-                             (step))))
-                (js/Promise.reject e)))
-            (step []
-              (try
-                (-> (js/Promise.resolve (f sync-get))
-                    ;; The wrapper is load-bearing, not noise: under nbb/SCI a
-                    ;; `letfn` sibling passed BY NAME to a JS callback is never
-                    ;; invoked (`(.catch fetch-and-retry)` silently does
-                    ;; nothing and the miss escapes as a generic failure).
-                    ;; Wrapping in an inline fn is correct on every runtime.
-                    (.catch (fn [e] (fetch-and-retry e))))
-                (catch :default e (fetch-and-retry e))))]
-      (step))))
+  through unchanged.
+
+  The 3-arity takes `seed`, a `{cid bytes}` map the cache STARTS from. It is
+  the only way to stop paying for a miss the caller has already resolved.
+
+  A caller that pre-fetches blocks into a cache of its OWN does not help this
+  trampoline at all: the cache here is private and starts empty, so `sync-get`
+  still throws on the first read of every block and `f` is still re-run once
+  per block. The caller's warm makes each of those K re-runs FETCH faster; it
+  does not make there be fewer of them, and the re-runs are the O(K^2) term.
+
+  Measured on kotobase-cf-wasm-staging (version 8bedd21a, 2026-08-27): adding
+  a per-graph prefetch wave in that Worker's own store layer moved reads from
+  ~4,400 to ~3,787 ms of CPU each -- real, and far short of what the wave
+  should be worth, because every warmed block was still discovered one at a
+  time here.
+
+  `seed` is trusted as already-verified bytes: the caller fetched them through
+  its own path, and re-checking would need a hasher this namespace
+  deliberately does not have (it is storage-agnostic by construction).
+  nil or an empty map behaves exactly like the 2-arity."
+  ([fetch1 f] (with-blocks fetch1 f nil))
+  ([fetch1 f seed]
+   (let [cache (atom (or seed {}))
+         sync-get (fn [cid]
+                    (if (contains? @cache cid)
+                      (get @cache cid)
+                      (throw (missing-block cid))))]
+     (letfn [(fetch-and-retry [e]
+               (if-let [d (miss-data e)]
+                 (-> (fetch1 (:cid d))
+                     (.then (fn [bytes]
+                              (swap! cache assoc (:cid d) bytes)
+                              (step))))
+                 (js/Promise.reject e)))
+             (step []
+               (try
+                 (-> (js/Promise.resolve (f sync-get))
+                     ;; The wrapper is load-bearing, not noise: under nbb/SCI a
+                     ;; `letfn` sibling passed BY NAME to a JS callback is never
+                     ;; invoked (`(.catch fetch-and-retry)` silently does
+                     ;; nothing and the miss escapes as a generic failure).
+                     ;; Wrapping in an inline fn is correct on every runtime.
+                     (.catch (fn [e] (fetch-and-retry e))))
+                 (catch :default e (fetch-and-retry e))))]
+       (step)))))
