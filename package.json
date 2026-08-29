@@ -7,7 +7,6 @@
     "test:cljs": "shadow-cljs compile test-node && node target/node-tests.js"
   },
   "dependencies": {
-    "@noble/hashes": "^1.4.0",
     "@noble/curves": "^1.7.0",
     "@noble/ciphers": "^2.2.0",
     "@ipld/dag-cbor": "^9.2.1",
