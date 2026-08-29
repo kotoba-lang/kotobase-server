@@ -2,8 +2,7 @@
   "Rotation-aware authenticated encryption profiles for the peer crypto seam."
   (:require [kotobase.cacao :as cacao]
             #?(:cljs ["@noble/ciphers/aes.js" :refer [gcmsiv]])
-            #?(:cljs ["@noble/hashes/hmac.js" :refer [hmac]])
-            #?(:cljs ["@noble/hashes/sha2.js" :refer [sha256]])))
+            #?(:cljs [sha2.core :as sha2])))
 
 (def ^:private envelope-version 2)
 (defn blind-fn [component] #?(:clj component :cljs (js/Promise.resolve component)))
@@ -29,8 +28,8 @@
            (throw (ex-info (str label " must decode to exactly 32 bytes")
                            {:type :crypto-key-invalid :key label :length (.-length key)})))
          key))
-     (defn- hex [^js bytes]
-       (apply str (map (fn [n] (.padStart (.toString n 16) 2 "0")) bytes)))
+     (defn- u8->vec [^js u8] (vec (js/Array.from u8)))
+     (defn- vec->u8 [v] (js/Uint8Array.from (clj->js v)))
 
      (defn aes-256-gcm-siv-profile
        [{:keys [graph tenant-id block-kind schema-version keyring
@@ -66,13 +65,15 @@
           :blind-fn
           (fn [component]
             (js/Promise.resolve
-             (str "h1:" (hex (hmac sha256 blind-key
-                                  (concat-bytes blind-domain (utf8 (pr-str component))))))))
+             (str "h1:" (sha2/hmac-sha256-hex (u8->vec blind-key)
+                                              (u8->vec (concat-bytes blind-domain
+                                                                     (utf8 (pr-str component))))))))
           :encrypt-fn
           (fn [bytes]
             (let [plain (js/Uint8Array. bytes)
-                  nonce (.slice (hmac sha256 aead-key
-                                      (concat-bytes nonce-domain plain)) 0 12)
+                  nonce (vec->u8 (subvec (sha2/hmac-sha256 (u8->vec aead-key)
+                                                           (u8->vec (concat-bytes nonce-domain plain)))
+                                         0 12))
                   kid-bytes (utf8 active)
                   ciphertext (.encrypt (gcmsiv aead-key nonce (aad-for active)) plain)]
               (js/Promise.resolve
