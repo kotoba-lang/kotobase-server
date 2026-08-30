@@ -9,8 +9,7 @@
   "dependencies": {
     "@noble/curves": "^1.7.0",
     "@noble/ciphers": "^2.2.0",
-    "@ipld/dag-cbor": "^9.2.1",
-    "hpke-js": "^1.8.0"
+    "@ipld/dag-cbor": "^9.2.1"
   },
   "devDependencies": {
     "shadow-cljs": "2.28.20"
