@@ -1,7 +1,7 @@
 (ns kotobase.server.security.crypto
   "Rotation-aware authenticated encryption profiles for the peer crypto seam."
   (:require [kotobase.cacao :as cacao]
-            #?(:cljs ["@noble/ciphers/aes.js" :refer [gcmsiv]])
+            #?(:cljs [aes.gcm-siv :refer [gcmsiv]])
             #?(:cljs [sha2.core :as sha2])))
 
 (def ^:private envelope-version 2)
