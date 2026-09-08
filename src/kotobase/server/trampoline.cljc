@@ -14,7 +14,7 @@
   efficient once the read touches few blocks (prolly-tree prefix pruning
   bounds this for a filtered read, so this stays cheap even as a graph
   grows -- unlike a full-prefix warm)."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn missing-block
   "Signal thrown by the sync get-fn on a cache miss; caught by `with-blocks`.
