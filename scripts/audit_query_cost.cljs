@@ -32,7 +32,7 @@
          '[kotobase.server.pattern-source :as ps]
          '[arrangement.datalog :as datalog]
          '[datom.source :as ds]
-         '[clojure.string :as str])
+         '[kotoba.lang.text :as str])
 
 (defn- passthrough [x] (js/Promise.resolve x))
 

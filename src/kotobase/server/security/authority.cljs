@@ -6,7 +6,7 @@
   produce `:effective-caps`, which is the only thing the handler reads, so
   they are alternatives rather than layers."
   (:require [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [kotobase.cacao :as cacao]
             [kotobase.cid :as cid]

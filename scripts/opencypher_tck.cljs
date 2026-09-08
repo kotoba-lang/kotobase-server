@@ -19,7 +19,7 @@
 ;; で状態を作る。kotobase の Cypher は **read-only subset** なので、この setup は
 ;; 構造的に実行できない。setup クエリと問い合わせクエリを分けて数える。
 
-(require '[clojure.string :as str]
+(require '[kotoba.lang.text :as str]
          '[kotobase.server.cypher :as cy])
 
 (def fs (js/require "node:fs"))
