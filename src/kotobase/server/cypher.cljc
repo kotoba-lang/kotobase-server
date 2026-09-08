@@ -67,7 +67,7 @@
   other than coalesce/toInteger,
   relationship CREATE, CREATE from MATCH, MERGE, DELETE, SET, REMOVE and every
   other write form outside the bounded standalone-node CREATE above."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def grammar-help
   "supported: MATCH/OPTIONAL MATCH, boolean WHERE (= <> < <= > >=, NOT/AND/OR), one WITH ... MATCH stage, RETURN projections/simple CASE, ORDER BY/SKIP/LIMIT; or authenticated standalone-node CREATE (... {id: lit}) [RETURN v]")
@@ -129,15 +129,15 @@
 (defn- literal? [t]
   (or (str/starts-with? t "\"") (str/starts-with? t "'")
       (re-matches #"-?[0-9]+(?:\.[0-9]+)?" t)
-      (contains? #{"NULL" "TRUE" "FALSE"} (str/upper-case (str t)))))
+      (contains? #{"NULL" "TRUE" "FALSE"} (str/upper (str t)))))
 
 (defn- literal->value [t]
   (cond
     (str/starts-with? t "\"") (subs t 1 (dec (count t)))
     (str/starts-with? t "'") (subs t 1 (dec (count t)))
-    (= "NULL" (str/upper-case (str t))) nil
-    (= "TRUE" (str/upper-case (str t))) true
-    (= "FALSE" (str/upper-case (str t))) false
+    (= "NULL" (str/upper (str t))) nil
+    (= "TRUE" (str/upper (str t))) true
+    (= "FALSE" (str/upper (str t))) false
     :else t))
 
 (defn- attr-name [t] (if (str/starts-with? t ":") t (str ":" t)))
@@ -152,7 +152,7 @@
 
 (defn- token-ident? [t] (boolean (and t (re-matches #"[A-Za-z_][A-Za-z0-9_/\-]*" t))))
 
-(defn- kw? [t kw] (and (token-ident? t) (= (str/upper-case t) kw)))
+(defn- kw? [t kw] (and (token-ident? t) (= (str/upper t) kw)))
 
 (def ^:private where-ops {"=" := "<>" :not= "<" :< "<=" :<= ">" :> ">=" :>=})
 (def ^:private return-aggs #{"count" "sum" "min" "max" "avg"})
@@ -306,7 +306,7 @@
   a bare `RETURN v.attr`, so a missing property is null here too -- which is the
   whole point of `coalesce(m.content, m.imageFile)` in LDBC IS 4."
   [ts projs ordinal]
-  (let [fname (keyword (str/lower-case (first ts)))]
+  (let [fname (keyword (str/lower (first ts)))]
     (loop [ts (vec (drop 2 ts)) args [] projs projs]
       (cond
         (and (token-ident? (first ts)) (= "." (second ts)) (token-ident? (nth ts 2 nil)))
@@ -497,7 +497,7 @@
                   (recur (vec (rest more)) acc projs)
                   [more acc projs]))
 
-              (and (token-ident? (first ts)) (contains? return-aggs (str/lower-case (first ts)))
+              (and (token-ident? (first ts)) (contains? return-aggs (str/lower (first ts)))
                    (= "(" (second ts)))
               (let [[agg _ v close & more] ts]
                 (when-not (token-ident? v) (fail "aggregate needs a variable" v))
@@ -505,13 +505,13 @@
                 (let [[alias more] (if (kw? (first more) "AS")
                                      (do (when-not (token-ident? (second more)) (fail "AS needs an alias name" (second more)))
                                          [(symbol (str "?" (second more))) (drop 2 more)])
-                                     [(symbol (str "?" (str/lower-case agg) "_" v)) more])
-                      acc (conj acc {:agg (keyword (str/lower-case agg)) :var (symbol (str "?" v)) :as alias})]
+                                     [(symbol (str "?" (str/lower agg) "_" v)) more])
+                      acc (conj acc {:agg (keyword (str/lower agg)) :var (symbol (str "?" v)) :as alias})]
                   (if (= "," (first more))
                     (recur (vec (rest more)) acc projs)
                     [(vec more) acc projs])))
               ;; fn(arg, ...) [AS alias] -- coalesce / toInteger
-              (and (token-ident? (first ts)) (contains? return-fns (str/lower-case (first ts)))
+              (and (token-ident? (first ts)) (contains? return-fns (str/lower (first ts)))
                    (= "(" (second ts)))
               (let [[more item projs] (parse-fn-call ts projs (count acc))
                     acc (conj acc item)]
@@ -562,10 +562,10 @@
                           ;; A cast is recorded rather than dropped: ordering
                           ;; "10" before "9" is a different answer from ordering
                           ;; 9 before 10, and LDBC IS 3 asks for the numeric one.
-                          fn-cast? (and (contains? return-fns (str/lower-case (first ts)))
+                          fn-cast? (and (contains? return-fns (str/lower (first ts)))
                                         (= "(" (second ts)))
                           [cast ts] (if fn-cast?
-                                      [(keyword (str/lower-case (first ts))) (vec (drop 2 ts))]
+                                      [(keyword (str/lower (first ts))) (vec (drop 2 ts))]
                                       [nil ts])
                           [v ts] (if (and (= "." (second ts)) (token-ident? (nth ts 2 nil)))
                                    [(projection-var (first ts) (nth ts 2)) (vec (drop 3 ts))]

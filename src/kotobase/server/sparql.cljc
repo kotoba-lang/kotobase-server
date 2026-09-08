@@ -33,7 +33,7 @@
   DISTINCT, HAVING, property paths, blank nodes, language tags, ^^typed
   literals, subqueries, BIND, VALUES, CONSTRUCT/ASK/DESCRIBE, nested
   OPTIONAL, expressions beyond a single `?var op literal` in FILTER."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def grammar-help
   "supported: SELECT ?v ...|*|(COUNT(?x) AS ?c) WHERE { s p o . OPTIONAL { s p o } FILTER(?v op lit) } | { t } UNION { t } [GROUP BY ?v] [ORDER BY ?v|DESC(?v)] [LIMIT n]; ops: = != < <= > >=; aggs: COUNT SUM MIN MAX AVG")
@@ -63,7 +63,7 @@
 (defn- term->pattern [t]
   (if (variable? t) (symbol t) (term->value t)))
 
-(defn- upper [t] (str/upper-case (str t)))
+(defn- upper [t] (str/upper (str t)))
 
 (defn- parse-triples
   "Triples separated by '.', stopping when stop? matches. -> [ts patterns]"

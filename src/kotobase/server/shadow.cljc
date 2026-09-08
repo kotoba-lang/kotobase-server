@@ -6,7 +6,7 @@
   response; shadow work is scheduled for comparison and can never change a
   successful primary result. This keeps XRPC translation outside either
   storage engine and lets a Worker pass the task to `waitUntil`."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn- valid-config!
   [{:keys [primary-handle shadow-handle schedule! observe! normalize eligible?]}]

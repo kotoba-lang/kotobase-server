@@ -48,7 +48,7 @@
   the plan is unbounded on its face.
 
   Pure: no store, no I/O, no platform split."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def default-policy
   "Stated in code, not discovered from the environment.

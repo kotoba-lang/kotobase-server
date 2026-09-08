@@ -35,7 +35,7 @@
   `store`, matching how storage was already injected."
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.set :as set]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
@@ -1518,7 +1518,7 @@
              (re-matches #"SHA256E-s([0-9]+)--([0-9a-fA-F]{64})(?:\..*)?" key)]
     (and (= (bytes-count bytes) #?(:clj (Long/parseLong size)
                                    :cljs (js/parseInt size 10)))
-         (= (str/lower-case digest) (bytes-hex bytes)))))
+         (= (str/lower digest) (bytes-hex bytes)))))
 
 (defn handle-blob
   "blob 面の dispatch。`op` は put|get|head|remove、`bytes` は put 時のみ。

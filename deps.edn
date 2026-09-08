@@ -10,7 +10,12 @@
  ;; kotobase.server.ipns requires kotobase.ipns (kotobase-client), whose
  ;; verify-head calls did-key->ed25519-pub directly to resolve the
  ;; signer's pubkey for every IPNS record signature check.
- :deps {;; datom-source is the IPatternSource contract kotobase.server.
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       ;; datom-source is the IPatternSource contract kotobase.server.
         ;; pattern-source implements (superproject ADR-2608039970). Zero deps
         ;; of its own; kotobase-client carries the shared index plan.
         io.github.kotoba-lang/datom-source

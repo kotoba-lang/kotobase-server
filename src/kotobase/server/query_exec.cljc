@@ -31,7 +31,7 @@
   (multi-clause or-join branch support not relied on here), ORDER BY
   (engine returns a set). The pushable path and the post-pass path are
   asserted to agree by the same test suite (identical results either way)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.set]))
 
 (declare execute-post-pass execute-pushed)

@@ -8,7 +8,7 @@
   拒否されるのは正しい挙動で、テストしたいのは『黙って通ってしまわないこと』。"
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotobase.server.cypher :as cy]))
 
 (defn- parse-or-reason

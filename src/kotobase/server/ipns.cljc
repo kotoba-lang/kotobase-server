@@ -23,7 +23,7 @@
   record's own `:name` field; a `graph` query param implying a graph-CID ->
   IPNS-name derivation is documented elsewhere but not implemented anywhere
   in this stack -- a separate, tracked follow-up."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotobase.ipns :as ipns]))
 
 (defn- valid-sequence?

@@ -3,7 +3,7 @@
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotobase.server.handler :as h]))
 
 (defn- passthrough
