@@ -6,7 +6,7 @@
 ;; coordinates are left out because nbb does not resolve them.
 ;;
 ;; :paths and every sha are COPIED, not chosen here.
-{:paths ["src"]
+{:paths ["src" "."]
  :deps {io.github.kotoba-lang/io-ipld {:git/url "https://github.com/kotoba-lang/io-ipld.git" :git/sha "e08dc3b2ab705be292e388cd1ad136381544a041"}
         io.github.kotoba-lang/datom-source {:git/url "https://github.com/kotoba-lang/datom-source.git" :git/sha "b42f6e6ff942c7f8a2856f8142ebffc13aa11098"}
         io.github.kotoba-lang/org-nist-aes {:git/url "https://github.com/kotoba-lang/org-nist-aes.git" :git/sha "d021bbe9f2d516d63bbbb2dd594aed93148fdf50"}
