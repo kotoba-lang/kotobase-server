@@ -47,6 +47,30 @@
   bounds MEMORY AND EXECUTION, and bounds the first read only in so far as
   the plan is unbounded on its face.
 
+  ## The refusal reports a cardinality, and that is measured
+
+  `over-budget`'s `:detail` names `n` -- the size of the prefetched union,
+  counted in `pattern-source` before any visibility decision exists -- and
+  `refusal-response` puts it on the wire in both `:details` and `:refusals`.
+  So a caller who can read no value of a graph still learns an exact count
+  of it, whenever their bounded patterns select more than the cap.
+
+  This is bounded in a way the library seam underneath is not, and the
+  difference is the whole reason to write it down. `kotobase.query.bridge/
+  materialize` takes `max-datoms` as an ARGUMENT, so a caller there
+  binary-searches an exact total in about a dozen probes
+  (`kotoba-lang/ayatori` `bench/inference-channel-01.edn`). Here the policy
+  is a literal in this file, every call site takes the 1-arity, and neither
+  policy key appears anywhere else -- so the disclosure is one number, only
+  for ranges already past the cap, with no way to probe below it.
+
+  Measured by `scripts/measure_wire_disclosure.cljs`, both directions:
+  removing `n` from the detail fails three assertions, flipping `>` to `>=`
+  fails the boundary one ALONE, and setting `allow-unbounded-patterns?` true
+  makes the harness refuse to report at all. Nothing here proposes changing
+  the message. A refusal that will not say why is its own defect, and which
+  of the two costs to pay is a decision, not a bug.
+
   Pure: no store, no I/O, no platform split."
   (:require [kotoba.lang.text :as str]))
 
