@@ -39,6 +39,7 @@
             [clojure.set :as set]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
+            [arrangement.core :as qs]
             [arrangement.datalog :as datalog]
             [kotobase.server.materialized :as materialized]
             [kotobase.server.pattern-source :as pattern-source]
@@ -186,8 +187,15 @@
                      :o (schema-wire-value (get item official))})))
           schema-properties)))
 
+;; Read through arrangement's PUBLIC accessor, not `(get-in db [:spo ...])`.
+;; arrangement renamed its in-memory index keys `:spo`/`:pso`/`:pos`/`:ocp` ->
+;; `:eavt`/`:aevt`/`:avet`/`:vaet`; a stale `:spo` reads as nil and answers
+;; zero rows SUCCESSFULLY. Measured 2026-09-10 advancing the kotobase-peer pin
+;; 4926d13 -> ed3ae49: this fn and `db-quads` below were the only two sites
+;; still naming an index key, and both went silently empty -- which made every
+;; `enforce_schema` transaction persist an empty delta while reporting :ok.
 (defn- current-values [db entity attribute]
-  (get-in db [:spo (str entity) (str attribute)] #{}))
+  (get (qs/entity-attrs db (str entity)) (str attribute) #{}))
 
 (defn- stored-value [value]
   (if (ipld/link? value) value (str value)))
@@ -236,8 +244,14 @@
    items))
 
 (defn- db-quads [db]
+  ;; `check-shape!` THROWS on a pre-rename db instead of letting `:eavt` read
+  ;; as nil and this fn return an empty set -- see `current-values` above.
+  ;; A whole-db scan has no public accessor (`eng/datoms` returns `:v_edn`
+  ;; wire strings, and the set-difference below needs raw values), so this one
+  ;; names the index key; the guard is what keeps that loud.
+  (qs/check-shape! db)
   (into #{}
-        (for [[entity attrs] (:spo db)
+        (for [[entity attrs] (:eavt db)
               [attribute values] attrs
               value values]
           {:s entity :p attribute :o value})))
