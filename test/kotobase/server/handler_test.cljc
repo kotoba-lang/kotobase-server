@@ -703,6 +703,60 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   ;; ADR-2607280100 D3, at the SERVER surface. kotobase-peer decides the row
+   ;; filter (D6: the judgment lives in one place); this test only pins that
+   ;; the decision REACHES a request that arrives over the wire, which is the
+   ;; thing an untrusted client cannot be relied on to do for itself.
+   ;;
+   ;; It discriminates in both directions on purpose. Before the kotobase-peer
+   ;; pin advance (4926d13 -> ed3ae49) clearance was binary, so a
+   ;; `read-classified/confidential` capability granted NOTHING and the
+   ;; `:dm.` assertions below were invisible -- this test fails at the old pin
+   ;; for the reason it names, not by crashing.
+   (deftest clearance-levels-are-enforced-at-the-server-surface
+     (async done
+       (let [store (mem-store)
+             ;; The prefix LIST says what is protected; a level says how much.
+             ;; `:secret.` is deliberately left UNLEVELLED -- that means
+             ;; `:restricted`, the top case, which is exactly what the binary
+             ;; rule already meant.
+             tx (pr-str [{:db/id "kotobase.policy/read"
+                          :kotobase.policy/protected-prefixes
+                          (pr-str [":dm." ":secret."])
+                          :kotobase.policy/prefix-levels {":dm." :confidential}}
+                         {:db/id "m1" :dm.message/text "conf"}
+                         {:db/id "s1" :secret.key/value "top"}
+                         {:db/id "p1" :public/note "open"}])
+             attrs-for (fn [caps]
+                         (-> (h/handle store "datoms" {:graph "clr-g"} caps)
+                             (.then (fn [r] (set (map :a (:datoms r)))))))
+             confidential {:did "did:web:analyst"
+                           :resources ["kotoba://can/datom:read-classified/confidential"]}
+             legacy {:did "did:web:admin"
+                     :resources ["kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact" {:graph "clr-g" :tx_edn tx} "did:web:x")
+             (.then (fn [r] (is (:ok r) (pr-str r)) (attrs-for nil)))
+             (.then (fn [a]
+                      (is (contains? a ":public/note"))
+                      (is (not (contains? a ":dm.message/text"))
+                          "anonymous reaches neither level")
+                      (is (not (contains? a ":secret.key/value")))
+                      (attrs-for confidential)))
+             (.then (fn [a]
+                      (is (contains? a ":public/note"))
+                      (is (contains? a ":dm.message/text")
+                          "confidential clearance reaches a :confidential prefix")
+                      (is (not (contains? a ":secret.key/value"))
+                          "and no higher: an unlevelled prefix is :restricted")
+                      (attrs-for legacy)))
+             (.then (fn [a]
+                      (is (contains? a ":dm.message/text"))
+                      (is (contains? a ":secret.key/value")
+                          "the legacy read-protected grant is still top clearance")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest private-metadata-surface-requires-read-capability
      (async done
        (let [store (assoc (mem-store) :security-mode :private)

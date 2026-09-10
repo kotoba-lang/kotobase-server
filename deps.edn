@@ -20,7 +20,7 @@
         ;; of its own; kotobase-client carries the shared index plan.
         io.github.kotoba-lang/datom-source
         {:git/url "https://github.com/kotoba-lang/datom-source.git"
-         :git/sha "b42f6e6ff942c7f8a2856f8142ebffc13aa11098"}
+         :git/sha "19dc98ad5272da6648c27eada8e1ed76cac85d8d"}
         ;; PIN ALIGNMENT, and it is load-bearing. org-w3-sparql-protocol pulls
         ;; kotobase-query -> arrangement 9e90426, which tools.deps selects over
         ;; the f4e3118 kotobase-peer depends on (:newer-version wins silently).
@@ -28,15 +28,40 @@
         ;; turned 78/332 green into 16 failures in fold and hot-db caching —
         ;; the engine's own libraries swapped out from under it by a query
         ;; surface's transitive tree. Top-level deps win, so they are stated.
+        ;;
+        ;; Advanced together 2026-09-10 with the kotobase-peer pin below.
+        ;; These floors are a RATCHET, not a freeze: held at their 2026-08
+        ;; values they became OLDER than what kotobase-peer was built against,
+        ;; and the same three names broke the same way in the same places --
+        ;; 53 failures + 1 error, every read answering empty. arrangement
+        ;; 9c9f45d still dominates the 9e90426 the sparql surface pulls in
+        ;; (checked: 9e90426 is an ancestor), so the 2026-08 protection is
+        ;; intact and the pin is merely no longer behind the engine.
+        ;;
+        ;; datom-source moved with them, and its evidence is different in kind.
+        ;; arrangement 9c9f45d calls `ds/in-range?`, `ds/scan-range` and
+        ;; `ds/IAsyncPatternSource`, none of which exist at b42f6e6. NONE of
+        ;; the 182 tests went red: ClojureScript reports an undeclared var in
+        ;; another namespace as a WARNING and emits the call anyway, so the
+        ;; suite stayed green over 8 `:undeclared-var` warnings (baseline had
+        ;; 0). nbb resolves at runtime and threw instead, which is the only
+        ;; reason this was seen at all. The floor to read here is the warning
+        ;; count, not the failure count.
+        ;;
+        ;; datom-source is pinned at 19dc98a -- what arrangement 9c9f45d
+        ;; itself names -- and deliberately NOT at its west pin 95cc74c, which
+        ;; renamed every source file from .cljc to .kotoba. Neither
+        ;; shadow-cljs nor nbb reads .kotoba, so that pin is unusable from any
+        ;; cljs consumer; this one is behind west on purpose.
         io.github.kotoba-lang/arrangement
         {:git/url "https://github.com/kotoba-lang/arrangement.git"
-         :git/sha "83b3fe95cca8c318d20bab09276afe43a13890d0"}
+         :git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
         io.github.kotoba-lang/io-ipld
         {:git/url "https://github.com/kotoba-lang/io-ipld.git"
-         :git/sha "e08dc3b2ab705be292e388cd1ad136381544a041"}
+         :git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
         io.github.kotoba-lang/prolly-tree
         {:git/url "https://github.com/kotoba-lang/prolly-tree.git"
-         :git/sha "e91eefcd21a4c5302868e519659433385a020961"}
+         :git/sha "3a12dd2b77430007031e408ee8db75d35f1757a1"}
         io.github.kotoba-lang/org-w3-sparql-protocol
         {:git/url "https://github.com/kotoba-lang/org-w3-sparql-protocol.git"
          :git/sha "49c59208442753458daf1dacbf15e1ba6539507f"}
@@ -52,9 +77,17 @@
         io.github.kotoba-lang/authority
         {:git/url "https://github.com/kotoba-lang/authority.git"
          :git/sha "232eef9b7969aa5990f9b5e48b1184f078500781"}
+        ;; ADR-2607280100 Step 5. Advanced 4926d13 -> d7dba09 (84 commits) to
+        ;; pick up four-level clearance in `kotobase-peer.policy`, which is
+        ;; what gives this server a classification layer at all: the judgment
+        ;; stays in one place (D6) and this repo only has to let it be
+        ;; reached. Nothing in src/ requires `kotoba.security.*` and nothing
+        ;; should -- the lattice arrives through kotobase-peer, which declares
+        ;; it. A `security` coordinate here that no namespace reads would be a
+        ;; dependency with no reader.
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "4926d13e992c7b9c52a44bb7aae672eb80c6c4af"}
+         :git/sha "d7dba097243612012f08fa9aca22f2021bd4055f"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
          :git/sha "97d44a184eb4eea5a0cca737d3c9771fde4b73ec"}
