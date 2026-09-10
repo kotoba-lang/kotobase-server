@@ -1380,6 +1380,65 @@
              (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
 
 ;; ── bounded fold (`max_novelty`) ────────────────────────────────────────────
+;; Root ADR-2609100100. `do-fold` passed nil/nil for `fold!`'s hydrate cache
+;; slots. Its own docstring explained why -- the store's `:db-cache-*` is
+;; CHAIN-keyed while `fold!`'s memo is SNAPSHOT-keyed, so feeding one into the
+;; other collides two key spaces -- and that reasoning is right. It simply
+;; never considered that the store carries a SECOND, snapshot-keyed pair:
+;; `:rows-cache-*`. So a fold re-paid the whole decrypt-and-scan on every
+;; attempt, which is the one thing `hydrate-db-cached` exists to prevent.
+;;
+;; This asserts the WIRING, because that is what was missing and because nil
+;; slots are silent: a fold with nil slots consults nothing and stores nothing
+;; while returning exactly the same answer. The counters go to zero if the
+;; slots are removed again, and the result assertions catch a fold that
+;; reaches the memo and gets it wrong.
+
+(defn- counting-rows-cache
+  "A `:rows-cache-*` pair over a plain map, counting both directions.
+   Promise-returning on cljs, plain on clj -- the same platform split the
+   real Cache-API-backed pair in xrpc.cljs has."
+  [gets puts]
+  (let [entries (atom {})]
+    {:rows-cache-get (fn [k]
+                       (swap! gets inc)
+                       #?(:clj (get @entries k)
+                          :cljs (js/Promise.resolve (get @entries k))))
+     :rows-cache-put! (fn [k v]
+                        (swap! puts inc)
+                        (swap! entries assoc k v)
+                        #?(:clj nil :cljs (js/Promise.resolve nil)))}))
+
+(defn- rows-cache-steps
+  "transact, fold, transact, fold. The SECOND fold is the one that matters:
+   the first has no prior snapshot -- `(indexed-cid state)` is nil -- so there
+   are no rows to memoise and the slots are correctly never touched. Asserting
+   on the first fold is how this test failed the first time it was written."
+  [store gets puts]
+  [(fn [] (h/handle store "transact"
+                    {:graph "rc" :tx_edn "[{:db/id \"a\" :t/v \"1\"}]"} "did:key:ztest"))
+   (fn [] (h/handle store "fold" {:graph "rc"} nil))
+   (fn [] (h/handle store "transact"
+                    {:graph "rc" :tx_edn "[{:db/id \"b\" :t/v \"2\"}]"} "did:key:ztest"))
+   (fn [] (do (reset! gets 0) (reset! puts 0) nil))
+   (fn [] (h/handle store "fold" {:graph "rc"} nil))
+   (fn []
+     (is (pos? @gets)
+         "the second fold consulted the snapshot-rows memo -- with nil slots this is 0")
+     (is (pos? @puts)
+         "and filled it -- with nil slots this is 0")
+     nil)
+   (fn [] (h/handle store "datoms" {:graph "rc"} nil))])
+
+(deftest fold-consults-and-fills-the-rows-cache
+  (let [gets (atom 0) puts (atom 0)
+        store (merge (mem-store) (counting-rows-cache gets puts))
+        steps (rows-cache-steps store gets puts)]
+    #?(:clj (run-steps steps)
+       :cljs (async done (-> (run-steps steps)
+                             (.then (fn [_] (done)))
+                             (.catch (fn [e] (is false (str "rows-cache steps rejected: " e)) (done))))))))
+
 ;; Regression guard for a SILENT wire-field drop: `do-fold` used to
 ;; destructure only `:graph`, so kotobase-client's long-standing
 ;; `:max-novelty` opt (sent on the wire as `max_novelty`) was accepted and
