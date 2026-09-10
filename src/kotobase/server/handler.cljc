@@ -1388,10 +1388,29 @@
   never trusted straight from the wire into the engine.
 
   `:async-get-fn` is forwarded for the same reason `do-datoms` forwards it
-  (see there). Cache slots are deliberately passed as nil: `fold!` keys its
-  hydrate cache by SNAPSHOT cid, while the store's `:db-cache-*` seam is
-  keyed by CHAIN cid -- feeding one into the other would collide two
-  different key spaces.
+  (see there). The hydrate cache slots take `:rows-cache-*`, NOT
+  `:db-cache-*`: `fold!` keys its hydrate cache by SNAPSHOT cid, the store's
+  `:db-cache-*` seam is keyed by CHAIN cid, and feeding one into the other
+  would collide two different key spaces. `:rows-cache-*` is the
+  snapshot-cid-keyed pair -- the same key space -- so it is the one that
+  fits.
+
+  This read nil/nil until 2026-09-10. The reasoning above was right about
+  `:db-cache-*` and simply never considered that the store carries a second,
+  snapshot-keyed pair. What that cost: `hydrate-db-cached` exists for exactly
+  the retried-fold case and says so, that `cache-put!` fires as soon as the
+  rows are computed, BEFORE novelty is applied -- specifically so a fold
+  attempt that hydrates successfully but then exceeds its CPU budget LATER
+  still leaves the cache populated for the next attempt. With nil slots
+  every attempt re-paid the whole decrypt-and-scan.
+
+  Measured on the graph that made this visible (root ADR-2609100100,
+  net-kotobase `yoro-social-v2`): 820 unfolded novelty entries over a
+  snapshot of ~1721 rows, a fold reaching 1725 decrypts before being killed
+  at the 30s ceiling -- i.e. the hydrate COMPLETED and the kill came after
+  it, which is precisely the case the memo was written for. Bounding did not
+  help, because the bound does not cover the hydrate: max_novelty 32, 128
+  and 400 all died at 37.0s, 33.7s and 36.0s.
 
   Response adds `:novelty_remaining` so a driver can loop until it hits 0
   without a separate dbStats round-trip.
@@ -1418,7 +1437,8 @@
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store)
-                        nil nil (:async-get-fn store) views)
+                        (:rows-cache-get store) (:rows-cache-put! store)
+                        (:async-get-fn store) views)
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                (let [folded-n (if max-novelty (min max-novelty novelty-n) novelty-n)]
