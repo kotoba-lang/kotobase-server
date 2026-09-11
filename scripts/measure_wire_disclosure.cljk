@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; scripts/measure_wire_disclosure.cljk — what a refused query tells the
 ;; caller about the graph it was refused from.
 ;;
@@ -16,7 +16,7 @@
 ;; Returns a COUNT of failures; exits 2 if its own control fails.
 ;;
 ;; Run (from the repo root):
-;;   nbb --classpath "src:<workspace src dirs>" scripts/measure_wire_disclosure.cljk
+;;   kbb --backend sci --classpath "src:<workspace src dirs>" scripts/measure_wire_disclosure.cljk
 
 (ns measure-wire-disclosure
   (:require [clojure.string :as str]

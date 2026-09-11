@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; Whole-suite nbb runner. The repo's CI path is shadow-cljs :node-test; this
 ;; needs no compile step, so it runs when a build slot is not available, and
 ;; it exercises the same runtime a Worker does.
