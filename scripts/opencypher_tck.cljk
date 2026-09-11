@@ -1,8 +1,8 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; openCypher TCK のクエリを kotobase の Cypher パーサに通し、**文法カバレッジ**を測る。
 ;;
 ;;   git clone https://github.com/opencypher/openCypher /tmp/oc
-;;   nbb --classpath src scripts/opencypher_tck.cljk /tmp/oc/tck/features
+;;   kbb --backend sci --classpath src scripts/opencypher_tck.cljk /tmp/oc/tck/features
 ;;
 ;; receipt は qualification/opencypher-tck-<date>.edn に手で束ねる(数字だけでなく
 ;; 「何を測っていないか」を書く必要があるため、生成物をそのまま正本にしない)。
