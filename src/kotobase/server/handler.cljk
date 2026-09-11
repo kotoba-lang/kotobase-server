@@ -1006,7 +1006,7 @@
 
   Was a 233-line hand-written subset compiling to map-form Datalog over
   `hot-db`. Retired (superproject ADR-2608039970) once
-  `test/kotobase/server/sparql_snapshot_test.cljc` showed the two answering
+  `test/kotobase/server/sparql_snapshot_test.cljk` showed the two answering
   identically across that subset's WHOLE grammar -- BGP, joins, OPTIONAL,
   UNION, ORDER BY, LIMIT, aggregates with and without GROUP BY, and FILTER.
   That suite is now a snapshot of those answers, so the behaviour the swap

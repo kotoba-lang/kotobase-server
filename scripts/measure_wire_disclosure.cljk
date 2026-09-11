@@ -1,5 +1,5 @@
 #!/usr/bin/env nbb
-;; scripts/measure_wire_disclosure.cljs — what a refused query tells the
+;; scripts/measure_wire_disclosure.cljk — what a refused query tells the
 ;; caller about the graph it was refused from.
 ;;
 ;; root ADR-2609108000 left one item open after the ayatori measurement
@@ -16,7 +16,7 @@
 ;; Returns a COUNT of failures; exits 2 if its own control fails.
 ;;
 ;; Run (from the repo root):
-;;   nbb --classpath "src:<workspace src dirs>" scripts/measure_wire_disclosure.cljs
+;;   nbb --classpath "src:<workspace src dirs>" scripts/measure_wire_disclosure.cljk
 
 (ns measure-wire-disclosure
   (:require [clojure.string :as str]
@@ -97,10 +97,10 @@
              adm/default-policy)
           (pr-str adm/default-policy))
   (doseq [[path anchor why]
-          [["src/kotobase/server/handler.cljc"
+          [["src/kotobase/server/handler.cljk"
             "(admission/over-budget (or (pattern-source/datom-count source) 0))"
             "datalog route — 1-arity, no cap from the request"]
-           ["src/kotobase/server/sparql_protocol.cljc"
+           ["src/kotobase/server/sparql_protocol.cljk"
             "(admission/over-budget (or (ps/datom-count source) 0))"
             "sparql route — same"]]]
     ;; The handler names this call twice (two routes); anchor uniqueness is
@@ -115,18 +115,18 @@
                        (let [src (try (fs/readFileSync p "utf8") (catch :default _ ""))]
                          (or (str/includes? src "max-source-datoms")
                              (str/includes? src "allow-unbounded-patterns?"))))
-                     ["src/kotobase/server/handler.cljc"
-                      "src/kotobase/server/sparql_protocol.cljc"
-                      "src/kotobase/server/pattern_source.cljc"]))
+                     ["src/kotobase/server/handler.cljk"
+                      "src/kotobase/server/sparql_protocol.cljk"
+                      "src/kotobase/server/pattern_source.cljk"]))
           "neither policy key appears outside admission.cljc")
 
   (println "\n=== E. the count is taken before visibility ===")
   (check! "datom-count is the size of the prefetched union"
-          (source-has-once? "src/kotobase/server/pattern_source.cljc"
+          (source-has-once? "src/kotobase/server/pattern_source.cljk"
                             "{::datom-count (count quads)}")
           "raw quads, counted where the source is built — no visible? in sight")
   (check! "the gate runs after the read and before the query"
-          (source-has-once? "src/kotobase/server/admission.cljc"
+          (source-has-once? "src/kotobase/server/admission.cljk"
                             "Applied AFTER the read and BEFORE the query")
           "stated in the ns, and that is the honest place for it")
 

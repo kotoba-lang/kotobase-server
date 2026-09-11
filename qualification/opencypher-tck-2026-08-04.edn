@@ -1,6 +1,6 @@
 {:receipt/type :opencypher-tck-grammar-coverage
  :receipt/at "2026-08-04"
- :receipt/tool "scripts/opencypher_tck.cljs"
+ :receipt/tool "scripts/opencypher_tck.cljk"
  :receipt/subject "kotobase.server.cypher/parse"
  :receipt/kotobase-server-sha "3b28df2325df38794dffa94f715d9a2d1cc8c34a"
 
@@ -81,7 +81,7 @@
  "この ns の docstring は当初から「every unsupported form is rejected loudly ...
   never silently misread」と宣言していた。宣言はあったが**それを検査する
   テストが無かった**ため、2 件とも長期間気付かれなかった。再発防止として
-  test/kotobase/server/cypher_test.cljc(6 deftest)を新設した。
+  test/kotobase/server/cypher_test.cljk(6 deftest)を新設した。
   ADR-2607250100 の『バーの 3 条件』でいう ③(回帰を検出する仕組み)が
   欠けていた典型例。"
 
