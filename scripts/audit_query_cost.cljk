@@ -4,7 +4,7 @@
 ;; `design-quality.audit` plays for UI (root ADR-2606141500 / isekai ADR-0007:
 ;; the loop is only real if the judge measures something).
 ;;
-;;   nbb --classpath "<server/src>:<deps>" scripts/audit_query_cost.cljs
+;;   nbb --classpath "<server/src>:<deps>" scripts/audit_query_cost.cljk
 ;;
 ;; ## What it measures, and why not milliseconds
 ;;

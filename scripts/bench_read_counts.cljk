@@ -3,7 +3,7 @@
 ;; graph sizes -- the receipt behind `rules-test`'s flat-vs-linear assertion
 ;; and behind root's 90-docs/kotobase-performance/2026-08-23-*.
 ;;
-;;   nbb --classpath "<server/src>:<every dep src>" scripts/bench_read_counts.cljs
+;;   nbb --classpath "<server/src>:<every dep src>" scripts/bench_read_counts.cljk
 ;;
 ;; COUNTS, not milliseconds: this workstation runs many concurrent agent
 ;; sessions and a wall-clock number here would be about the host

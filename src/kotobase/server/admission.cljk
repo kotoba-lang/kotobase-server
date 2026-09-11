@@ -64,7 +64,7 @@
   policy key appears anywhere else -- so the disclosure is one number, only
   for ranges already past the cap, with no way to probe below it.
 
-  Measured by `scripts/measure_wire_disclosure.cljs`, both directions:
+  Measured by `scripts/measure_wire_disclosure.cljk`, both directions:
   removing `n` from the detail fails three assertions, flipping `>` to `>=`
   fails the boundary one ALONE, and setting `allow-unbounded-patterns?` true
   makes the harness refuse to report at all. Nothing here proposes changing
