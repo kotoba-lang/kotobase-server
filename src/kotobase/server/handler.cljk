@@ -1480,7 +1480,8 @@
   (let [chain ((:head-get store) graph)]
     (then* (when chain
              (eng/view-rows (:get-fn store) chain view
-                            (visible-of store) (:decrypt-fn store)))
+                            (visible-of store) (:decrypt-fn store)
+                            (:blind-fn store) (:async-get-fn store)))
            (fn [result]
              (if result
                (merge {:ok true :graph graph} result)
