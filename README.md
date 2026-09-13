@@ -97,3 +97,12 @@ policy/owner/clearance tests remain enabled. The full-snapshot cache regression
 now expects the incremental ClojureScript fold to avoid whole-row caches; JVM
 rebuild retains its cache expectations. Qualification uses Shadow CLJS, not the
 native compiler path.
+
+### Direct materialized-view discovery
+
+`do-view` forwards both the blind function and direct async fetch seam to the
+peer, matching the other narrow read paths. A cold fixture allows only the two
+synchronous control-root reads; the stored view must use direct discovery and
+return its original row. Compiled consumer handler suite: 56 tests / 335
+assertions pass with the merged selective-view peer pin. Stored data format and
+read visibility policy remain unchanged.

@@ -1835,3 +1835,27 @@
             (js/Promise.resolve nil) ["transact" "kg.ingest"])
            (.catch #(is false (str %)))
            (.finally done)))))
+
+#?(:cljs
+   (deftest cold-materialized-view-forwards-direct-block-discovery
+     (async done
+       (let [store (mem-store) sync-reads (atom 0) direct-reads (atom 0)]
+         (-> (h/handle store "transact" {:graph "view-cold"
+                                         :tx_edn "[{:db/id \"a\" :view/value \"kept\"}]"} "did:key:ztest")
+             (.then (fn [_] (h/handle store "fold" {:graph "view-cold"
+                                                    :views_edn "{\"values\" {\"attrs\" [\":view/value\"]}}"} nil)))
+             (.then
+              (fn [_]
+                (h/do-view (assoc store
+                                 :get-fn (fn [cid]
+                                           (when (> (swap! sync-reads inc) 2)
+                                             (throw (js/Error. "synchronous view data discovery")))
+                                           ((:get-fn store) cid))
+                                 :async-get-fn (fn [cid] (swap! direct-reads inc)
+                                                 (js/Promise.resolve ((:get-fn store) cid))))
+                           {:graph "view-cold" :view "values"})))
+             (.then (fn [result]
+                      (is (:ok result))
+                      (is (= ["a"] (mapv :e (:rows result))))
+                      (is (pos? @direct-reads))))
+             (.catch #(is false (str %))) (.finally done))))))
