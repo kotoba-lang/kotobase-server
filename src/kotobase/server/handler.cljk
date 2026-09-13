@@ -441,7 +441,8 @@
                     (fn [rows]
                       (policy/assert-write-authorized!
                        (policy/policy-of rows) context quads (:security-mode store))
-                      (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
+                      (then* (eng/commit! (:put! store) get-fn quads prev-chain
+                                         (:encrypt-fn store) (:blind-fn store))
                              (fn [chain]
                                ((:head-put! store) graph chain)
                                {:ok true :graph graph :commit chain :previous_commit prev-chain
@@ -567,7 +568,8 @@
            (fn [rows]
              (policy/assert-write-authorized!
               (policy/policy-of rows) context quads (:security-mode store))
-             (then* (eng/commit! (:put! store) get-fn quads prev-chain (:encrypt-fn store))
+             (then* (eng/commit! (:put! store) get-fn quads prev-chain
+                                         (:encrypt-fn store) (:blind-fn store))
                     (fn [chain]
                       ((:head-put! store) graph chain)
                       {:chain chain :previous-chain prev-chain}))))))
