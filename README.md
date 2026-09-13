@@ -75,3 +75,9 @@ for explicit local/legacy-public use.
 npm install
 npm run test:cljs
 ```
+
+### Cold authorization reads (2026-09-13)
+
+Read visibility and owner-attribute lookups forward the store's optional `:async-get-fn`, just like the data read and write-policy lookup. Without it a cold graph restarts the whole handler per missing metadata block before authorization completes. The same policy rows, owner set, and filters remain authoritative. A cold-store regression permits synchronous head access only and proves anonymous redaction, owner-only visibility, and capability-based visibility after a fold.
+
+Consumer compiled verification: 54 handler tests / 322 assertions. The patch removes five failures in the new cold-store regression; one pre-existing clearance-level failure remains unchanged. This result uses the production graph consumer's exact dependency set, not a claim that the full server suite is green.

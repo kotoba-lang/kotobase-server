@@ -323,7 +323,8 @@
                (mapcat (fn [attr]
                          (->> (eng/hot-datoms (:get-fn store) chain
                                               {:index :avet :components [attr viewer-did]}
-                                              (constantly true) (:blind-fn store) (:decrypt-fn store))
+                                              (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                              (:async-get-fn store))
                               (map :e))))
                owner-attrs)
          :cljs
@@ -332,7 +333,8 @@
                (map (fn [attr]
                       (eng/hot-datoms (:get-fn store) chain
                                       {:index :avet :components [attr viewer-did]}
-                                      (constantly true) (:blind-fn store) (:decrypt-fn store)))
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store)))
                     owner-attrs)))
              (.then (fn [^js lists]
                       (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
@@ -351,7 +353,8 @@
         #?(:clj visible? :cljs (js/Promise.resolve visible?)))
           (then* (eng/hot-datoms (:get-fn store) chain
                                  {:index :eavt :components [policy/policy-entity]}
-                                 (constantly true) (:blind-fn store) (:decrypt-fn store))
+                                 (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store))
                  (fn [rows]
                    (let [policy (policy/policy-of rows)]
                      (then* (owned-entities store chain policy viewer-did)
@@ -430,7 +433,7 @@
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
                                       (constantly true) (:blind-fn store) (:decrypt-fn store)
-                                      (:async-get-fn store))
+                                 (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* prepared-quads
            (fn [quads]
@@ -558,7 +561,7 @@
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
                                       (constantly true) (:blind-fn store) (:decrypt-fn store)
-                                      (:async-get-fn store))
+                                 (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* policy-rows
            (fn [rows]
