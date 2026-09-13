@@ -1768,3 +1768,36 @@
                                   "KG policy lookup used async block discovery"))))])
             (.then (fn [_] (done)))
             (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+#?(:cljs
+   (deftest cold-policy-and-owner-reads-use-direct-discovery
+     (async done
+       (let [store (mem-store)
+             tx (pr-str [{:db/id "kotobase.policy/read"
+                          :kotobase.policy/protected-prefixes "[\":dm.\"]"
+                          :kotobase.policy/owner-attrs "[\":dm.message/author\"]"}
+                         {:db/id "m1" :dm.message/text "one" :dm.message/author "did:web:alice"}
+                         {:db/id "m2" :dm.message/text "two" :dm.message/author "did:web:bob"}])]
+         (-> (h/handle store "transact" {:graph "cold-policy" :tx_edn tx} "did:web:x")
+             (.then (fn [_] (h/handle store "fold" {:graph "cold-policy"} nil)))
+             (.then
+              (fn [_]
+                (let [head ((:head-get store) "cold-policy")
+                      cold (assoc store
+                                  :get-fn (fn [cid]
+                                            (if (= cid head) ((:get-fn store) cid)
+                                                (throw (js/Error. "synchronous cold block read"))))
+                                  :async-get-fn (fn [cid] (js/Promise.resolve ((:get-fn store) cid))))
+                      read! (fn [auth] (h/handle cold "datoms" {:graph "cold-policy"} auth))
+                      messages (fn [r] (set (map :e (filter #(= ":dm.message/text" (:a %)) (:datoms r)))))]
+                  (-> (read! nil)
+                      (.then (fn [r]
+                               (is (:ok r)) (is (empty? (messages r)))
+                               (read! {:did "did:web:alice" :resources []})))
+                      (.then (fn [r]
+                               (is (:ok r)) (is (= #{"m1"} (messages r)))
+                               (read! {:did "did:web:reader" :resources ["kotoba://can/datom:read-protected"]})))
+                      (.then (fn [r]
+                               (is (:ok r)) (is (= #{"m1" "m2"} (messages r)))))))))
+             (.then (fn [_] (done)))
+             (.catch (fn [e] (is false (str e)) (done))))))))
