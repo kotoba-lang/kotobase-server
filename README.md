@@ -81,3 +81,19 @@ npm run test:cljs
 Read visibility and owner-attribute lookups forward the store's optional `:async-get-fn`, just like the data read and write-policy lookup. Without it a cold graph restarts the whole handler per missing metadata block before authorization completes. The same policy rows, owner set, and filters remain authoritative. A cold-store regression permits synchronous head access only and proves anonymous redaction, owner-only visibility, and capability-based visibility after a fold.
 
 Consumer compiled verification: 54 handler tests / 322 assertions. The patch removes five failures in the new cold-store regression; one pre-existing clearance-level failure remains unchanged. This result uses the production graph consumer's exact dependency set, not a claim that the full server suite is green.
+
+### Write-side novelty metadata (2026-09-13)
+
+Ordinary transactions and knowledge-graph ingestion now pass the store's
+`blind-fn` into `commit!`. The peer pin includes index-position-correct subject
+routing and keyed attribute membership. Without this wiring, even a missing
+policy entity caused every write to decrypt all unreflected transactions.
+Existing legacy transactions remain conservative until compacted.
+
+The compiled consumer handler suite passes 55 tests / 332 assertions, including
+both write entry points followed by policy and bound-attribute reads over 20
+unrelated transactions. Those reads decrypt zero unrelated payloads. Existing
+policy/owner/clearance tests remain enabled. The full-snapshot cache regression
+now expects the incremental ClojureScript fold to avoid whole-row caches; JVM
+rebuild retains its cache expectations. Qualification uses Shadow CLJS, not the
+native compiler path.

@@ -1477,10 +1477,10 @@
    (fn [] (do (reset! gets 0) (reset! puts 0) nil))
    (fn [] (h/handle store "fold" {:graph "rc"} nil))
    (fn []
-     (is (pos? @gets)
-         "the second fold consulted the snapshot-rows memo -- with nil slots this is 0")
-     (is (pos? @puts)
-         "and filled it -- with nil slots this is 0")
+     (is (#?(:clj pos? :cljs zero?) @gets)
+         "incremental cljs fold does not hydrate the snapshot; JVM rebuild uses the cache")
+     (is (#?(:clj pos? :cljs zero?) @puts)
+         "incremental cljs fold does not serialize whole snapshot rows")
      nil)
    (fn [] (h/handle store "datoms" {:graph "rc"} nil))])
 
@@ -1801,3 +1801,37 @@
                                (is (:ok r)) (is (= #{"m1" "m2"} (messages r)))))))))
              (.then (fn [_] (done)))
              (.catch (fn [e] (is false (str e)) (done))))))))
+
+#?(:cljs
+   (deftest writes-persist-pruning-metadata-for-policy-and-attribute-reads
+     (async done
+       (-> (reduce
+            (fn [p method]
+              (.then p
+                     (fn [_]
+                       (let [decrypts (atom 0)
+                             store (assoc (mem-store) :decrypt-fn
+                                          (fn [bytes] (swap! decrypts inc) (passthrough bytes)))
+                             write! (fn [i]
+                                      (h/handle store method
+                                                (if (= method "transact")
+                                                  {:graph "metadata" :tx_edn (pr-str [{:db/id (str "noise-" i) :noise/value i}])}
+                                                  {:graph "metadata" :id (str "noise-" i) :type "noise"})
+                                                "did:key:ztest"))]
+                         (-> (reduce (fn [prior i] (.then prior (fn [_] (write! i))))
+                                     (js/Promise.resolve nil) (range 20))
+                             (.then (fn [_]
+                                      (reset! decrypts 0)
+                                      (write! 20)))
+                             (.then (fn [response]
+                                      (is (:ok response))
+                                      (is (= 0 @decrypts) (str method " policy lookup skips unrelated payloads"))
+                                      (reset! decrypts 0)
+                                      (h/handle store "datoms" {:graph "metadata" :index "aevt" :components_edn ["missing/attribute"]} nil)))
+                             (.then (fn [response]
+                                      (is (:ok response))
+                                      (is (empty? (:datoms response)))
+                                      (is (= 0 @decrypts) (str method " attribute lookup skips unrelated payloads")))))))))
+            (js/Promise.resolve nil) ["transact" "kg.ingest"])
+           (.catch #(is false (str %)))
+           (.finally done)))))

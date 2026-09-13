@@ -87,7 +87,7 @@
         ;; dependency with no reader.
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "d7dba097243612012f08fa9aca22f2021bd4055f"}
+         :git/sha "e37587f477813d1a0669641a140c853dd74c17bd"}
         io.github.kotoba-lang/kotobase-client
         {:git/url "https://github.com/kotoba-lang/kotobase-client.git"
          :git/sha "97d44a184eb4eea5a0cca737d3c9771fde4b73ec"}
