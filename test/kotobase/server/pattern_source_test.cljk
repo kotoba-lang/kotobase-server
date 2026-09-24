@@ -8,7 +8,7 @@
             [datom.source :as src]
             [kotobase.server.handler :as h]
             [kotobase.server.pattern-source :as ps]
-            #?(:clj [clojure.edn] :cljs [cljs.reader])))
+            #?(:clj [kotoba.lang.edn] :cljs [cljs.reader])))
 
 (defn- passthrough [x] #?(:clj x :cljs (js/Promise.resolve x)))
 
@@ -46,7 +46,7 @@
   the conversion between them."
   [rows]
   (into #{} (map (fn [{:keys [e a v_edn]}]
-                   {:s e :p a :o #?(:clj (clojure.edn/read-string v_edn)
+                   {:s e :p a :o #?(:clj (kotoba.lang.edn/read-string v_edn)
                                     :cljs (cljs.reader/read-string v_edn))}))
         rows))
 

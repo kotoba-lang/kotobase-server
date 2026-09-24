@@ -7,7 +7,7 @@
   in-memory DB and executes the shared q/pull/entity semantics.  Primary and
   candidate engines can therefore differ physically without reimplementing
   the public read contract."
-  (:require #?(:clj  [clojure.edn :as edn]
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])
             [arrangement.core :as arrangement]
             [kotobase-peer.core :as eng]))

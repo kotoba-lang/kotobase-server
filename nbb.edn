@@ -7,7 +7,12 @@
 ;;
 ;; :paths and every sha are COPIED, not chosen here.
 {:paths ["src" "."]
- :deps {io.github.kotoba-lang/io-ipld {:git/url "https://github.com/kotoba-lang/io-ipld.git" :git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
+ :deps {
+        ;; kotoba.lang.edn replaced clojure.edn here (2026-09-23). An explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, and kbb resolves git deps
+        ;; only from nbb.edn, so every project file this repo has names it.
+        io.github.kotoba-lang/edn {:git/sha "79dba32c8892058842c57783f06a2dfe4601aeb0"}
+       io.github.kotoba-lang/io-ipld {:git/url "https://github.com/kotoba-lang/io-ipld.git" :git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
         io.github.kotoba-lang/datom-source {:git/url "https://github.com/kotoba-lang/datom-source.git" :git/sha "19dc98ad5272da6648c27eada8e1ed76cac85d8d"}
         io.github.kotoba-lang/org-nist-aes {:git/url "https://github.com/kotoba-lang/org-nist-aes.git" :git/sha "d021bbe9f2d516d63bbbb2dd594aed93148fdf50"}
         io.github.kotoba-lang/org-nist-sha2 {:git/url "https://github.com/kotoba-lang/org-nist-sha2.git" :git/sha "e7c1b250adf3291ef99424fa85d8e7381cb086fb"}

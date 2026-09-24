@@ -33,7 +33,7 @@
   share ONE implementation instead of re-deriving it. The only behavioral
   change from the original: crypto fns move from a hardwired `require` into
   `store`, matching how storage was already injected."
-  (:require #?(:clj  [clojure.edn :as edn]
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
             [clojure.set :as set]
