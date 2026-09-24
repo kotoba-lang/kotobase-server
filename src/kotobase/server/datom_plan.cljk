@@ -37,7 +37,7 @@
   in the same words — a correct answer at O(database) beats a fast wrong one,
   and `:post-filter` is RETURNED rather than applied so a caller can see what
   the pushdown did not cover."
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 (defn plan
   "`[s p o]` -> `{:index \"...\" :components [...] :post-filter [s p o]}`.
