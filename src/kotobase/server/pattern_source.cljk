@@ -74,7 +74,7 @@
   predicate, despite the identical name and the identical purpose. A
   `{:s :p :o}` predicate handed to `source-for` silently matches nothing and
   therefore hides nothing."
-  (:require #?(:clj [clojure.edn :as edn] :cljs [cljs.reader :as edn])
+  (:require #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])
             [datom.source :as src]
             [kotobase-peer.core :as eng]
             [kotobase.server.datom-plan :as plan]))
