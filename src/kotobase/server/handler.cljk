@@ -36,7 +36,7 @@
   (:require #?(:clj  [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
-            [clojure.set :as set]
+            [kotoba.lang.coll :as set]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [arrangement.core :as qs]

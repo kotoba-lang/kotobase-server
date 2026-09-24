@@ -5,7 +5,7 @@
   attenuated. Biscuits (bottom) are attenuated by their own key chain. Both
   produce `:effective-caps`, which is the only thing the handler reads, so
   they are alternatives rather than layers."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as set]
             [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [kotobase.cacao :as cacao]

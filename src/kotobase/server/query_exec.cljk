@@ -32,7 +32,7 @@
   (engine returns a set). The pushable path and the post-pass path are
   asserted to agree by the same test suite (identical results either way)."
   (:require [kotoba.lang.text :as str]
-            [clojure.set]))
+            [kotoba.lang.coll]))
 
 (declare execute-post-pass execute-pushed)
 
@@ -179,7 +179,7 @@
   (reduce (fn [groups clause]
             (let [vs (clause-vars clause)
                   [touching separate] ((juxt filter remove)
-                                       (fn [g] (seq (clojure.set/intersection vs (:vars g)))) groups)]
+                                       (fn [g] (seq (kotoba.lang.coll/intersection vs (:vars g)))) groups)]
               (conj (vec separate)
                     {:vars (into vs (mapcat :vars touching))
                      :clauses (into [clause] (mapcat :clauses touching))})))
@@ -194,7 +194,7 @@
   final tie-breaker.  Keeping this heuristic here makes the choice explicit and
   replaceable when the engine exposes cardinality estimates."
   [bound {:keys [vars clauses]}]
-  [(count (clojure.set/intersection bound vars))
+  [(count (kotoba.lang.coll/intersection bound vars))
    (reduce (fn [score [s p o]]
              (+ score
                 (if (symbol? s) 0 10)
@@ -217,7 +217,7 @@
   [left right]
   (if (empty? left)
     right
-    (let [shared (vec (clojure.set/intersection (set (keys (first left))) (set (keys (first right)))))
+    (let [shared (vec (kotoba.lang.coll/intersection (set (keys (first left))) (set (keys (first right)))))
           idx (group-by #(mapv % shared) right)]
       (vec (mapcat (fn [l] (map #(merge l %) (get idx (mapv l shared)))) left)))))
 
@@ -244,7 +244,7 @@
     (if (empty? bind-maps)
       (solve-all)
       (let [bound (set (keys (first bind-maps)))
-            shared (vec (clojure.set/intersection bound (set vars)))
+            shared (vec (kotoba.lang.coll/intersection bound (set vars)))
             tuples (when (seq shared) (distinct (map #(mapv % shared) bind-maps)))]
         (if (or (empty? shared) (> (count tuples) component-pushdown-limit))
           (solve-all)
@@ -299,7 +299,7 @@
           (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps remaining-paths)
 
           :else
-          (let [connected (filter #(seq (clojure.set/intersection bound (:vars %))) pending)
+          (let [connected (filter #(seq (kotoba.lang.coll/intersection bound (:vars %))) pending)
                 candidates (or (seq connected) (seq pending))
                 pick (pick-component bound candidates)
                 rows (solve-component engine-query bind-maps pick)]
