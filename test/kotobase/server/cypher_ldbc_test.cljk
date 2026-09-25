@@ -72,7 +72,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                         #"parameter has no value"
                         (cypher/parse "MATCH (n {id: $pid}) RETURN n" {}))))
 
@@ -132,7 +132,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                           #"does not implement"
                           (qe/execute engine-query {:find '[?a] :where [] :some-future-thing true} adjacency))))
   (testing "a path query with no adjacency fn is refused, not answered zero-hop"
@@ -141,7 +141,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                           #"no adjacency fn"
                           (qe/execute engine-query
                                       (cypher/parse "MATCH (n:Person {id: \"1\"})-[:knows*0..]->(f) RETURN f.id"))))))
@@ -161,7 +161,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                  (cypher/parse q {}))
         (str label " must still be rejected loudly, not approximated"))))
 
@@ -199,7 +199,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                           #"no adjacency fn"
                           (qe/execute engine-query
                                       (cypher/parse (str "MATCH (n:Person {id: \"1\"}) "
@@ -233,7 +233,7 @@
                         ;; running on a JVM build and running on node. `:default` keeps
                         ;; the substantive half of the assertion — the MESSAGE — and
                         ;; widens the type from ex-info to any throwable.
-                        #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                        :default
                (cypher/parse "MATCH (n:Person {id: \"1\"}) RETURN upper(n.firstName)" {}))))
 
 (deftest boolean-where-expressions-preserve-three-valued-property-lookup
